@@ -359,6 +359,8 @@ Configure through command-line options and environment variables:
 | `ALLOWED_HOSTS` | Comma-separated extra allowed Host header values for Streamable HTTP DNS rebinding protection | empty |
 | `ALLOWED_ORIGINS` | Comma-separated extra allowed Origin header values for Streamable HTTP DNS rebinding protection | empty |
 | `SEMANTIC_SCHOLAR_API_KEY` | Optional Semantic Scholar API key. When set, `citation_graph` sends it as the `x-api-key` header; per [Semantic Scholar's docs](https://www.semanticscholar.org/product/api) this grants a higher authenticated request-rate limit. When unset, requests are unauthenticated (unchanged behavior). | empty |
+| `SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL` | Minimum seconds between Semantic Scholar requests. `0` (default) disables pacing. An authenticated API key grants ~1 request/second across all endpoints, so set this to ~`1.1` to pace requests proactively instead of bursting and relying on 429 retry/backoff. | `0` |
+| `CITATION_MAX_EDGES` | Optional cap on citation/reference edges returned by `citation_graph`'s legacy (non-paginated) path. Unset (default) returns all edges; a `truncated` flag is added when the cap bites. | empty |
 
 ## 🧪 Testing
 
@@ -407,6 +409,9 @@ Optional parameters (all opt-in; omit them for the legacy full-output behavior):
 - `limit` (integer, 1–1000): max edges per direction, using Semantic Scholar's paginated endpoints.
 - `offset` (integer, ≥ 0): pagination offset. Applies **only** together with `limit` or `compact`; passing `offset` alone is ignored and falls through to the legacy path.
 - `compact` (boolean): strips author lists + nested `external_ids` and minifies the JSON for lower token cost.
+- `counts_only` (boolean): return **only** the paper's true citation/reference totals as `total_citations`/`total_references` (Semantic Scholar's scalar `citationCount`/`referenceCount`) with no edge lists — one endpoint, a small fixed payload. Takes precedence over `limit`/`offset`/`compact`.
+
+> **Note on `citation_count`/`reference_count` in the graph modes:** these count the edges *returned*, not the paper's true totals. The default/legacy nested call is capped by Semantic Scholar at 1000 per direction, and in paginated mode they reflect the current page. For authoritative totals use `counts_only: true` (which returns `total_citations`/`total_references`).
 
 When paginating (`limit` or `compact` set), `citation_count`/`reference_count` report the edges returned in the **current page**, not the paper's totals. The response carries a `pagination` block with an independent cursor per direction — `pagination.citations.next` and `pagination.references.next` (each is the next `offset`, or `null` when that direction is exhausted). `offset` is a single value applied to **both** directions, so to page deeply through one direction, advance `offset` to its `next`; the other direction re-paginates from the same `offset` (references are usually small enough to fit one page).
 
@@ -416,6 +421,13 @@ result = await call_tool("citation_graph", {
     "compact": True,
     "limit": 50
 })
+
+# True totals only (no edge lists, small fixed payload):
+result = await call_tool("citation_graph", {
+    "paper_id": "1706.03762",
+    "counts_only": True
+})
+# -> {"counts_only": true, "total_citations": 180624, "total_references": 41, ...}
 ```
 
 ### Research Alerts

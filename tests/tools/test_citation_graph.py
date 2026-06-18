@@ -1,6 +1,8 @@
 """Tests for citation graph tool."""
 
+import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -1395,3 +1397,290 @@ async def test_citation_graph_cap_zero(monkeypatch):
     assert result["citations"] == []
     assert result["references"] == []
     assert result["truncated"] is True
+
+
+# --- C4a: counts_only mode (true scalar totals) ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_citation_graph_counts_only():
+    """counts_only returns the paper's TRUE scalar totals via ONE endpoint, no edges.
+
+    Pins the F1 fix: `citation_count` here is S2's authoritative citationCount
+    (180624 for 1706.03762), NOT the page-capped edge count of the graph modes.
+    """
+    counts_payload = {
+        "paperId": "root-paper",
+        "title": "Attention Is All You Need",
+        "year": 2017,
+        "externalIds": {"ArXiv": "1706.03762"},
+        "citationCount": 180624,
+        "referenceCount": 41,
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = counts_payload
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        response = await handle_citation_graph(
+            {"paper_id": "1706.03762", "counts_only": True}
+        )
+
+    # One endpoint only (no root + /citations + /references fan-out).
+    assert mock_client.get.await_count == 1
+    # The request asks S2 for the scalar count fields.
+    url = mock_client.get.call_args.args[0]
+    assert "citationCount" in url and "referenceCount" in url
+
+    payload = json.loads(response[0].text)
+    assert payload["status"] == "success"
+    assert payload["counts_only"] is True
+    # TRUE totals, under distinct keys (not the graph modes' citation_count).
+    assert payload["total_citations"] == 180624
+    assert payload["total_references"] == 41
+    assert "citation_count" not in payload
+    assert payload["paper"]["arxiv_id"] == "1706.03762"
+    # No edge lists / pagination block in counts mode.
+    assert "citations" not in payload
+    assert "references" not in payload
+    assert "pagination" not in payload
+
+
+@pytest.mark.asyncio
+async def test_citation_graph_counts_only_precedence():
+    """counts_only takes precedence over limit/compact: one endpoint, no edges."""
+    counts_payload = {
+        "paperId": "root-paper",
+        "title": "Root Paper",
+        "year": 2024,
+        "externalIds": {"ArXiv": "2401.12345"},
+        "citationCount": 5,
+        "referenceCount": 3,
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = counts_payload
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        response = await handle_citation_graph(
+            {
+                "paper_id": "2401.12345",
+                "counts_only": True,
+                "limit": 5,
+                "compact": True,
+            }
+        )
+
+    # counts_only wins over the paginated/compact path.
+    assert mock_client.get.await_count == 1
+    payload = json.loads(response[0].text)
+    assert payload["counts_only"] is True
+    assert "pagination" not in payload
+    assert payload["total_citations"] == 5
+
+
+@pytest.mark.asyncio
+async def test_citation_graph_counts_only_strict_bool():
+    """A non-bool truthy counts_only (string "true") must NOT enable counts mode;
+    it falls through to the legacy graph path (defense-in-depth, like compact)."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = _legacy_mock_payload()
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        response = await handle_citation_graph(
+            {"paper_id": "2401.12345", "counts_only": "true"}
+        )
+
+    payload = json.loads(response[0].text)
+    # Legacy graph path, not counts mode.
+    assert "counts_only" not in payload
+    assert "citations" in payload
+
+
+@pytest.mark.asyncio
+async def test_citation_graph_counts_only_null_counts():
+    """Missing S2 counts (null) pass through as null without crashing."""
+    counts_payload = {
+        "paperId": "root-paper",
+        "title": "Root Paper",
+        "year": 2024,
+        "externalIds": {"ArXiv": "2401.12345"},
+        # citationCount / referenceCount intentionally absent.
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = counts_payload
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        response = await handle_citation_graph(
+            {"paper_id": "2401.12345", "counts_only": True}
+        )
+
+    payload = json.loads(response[0].text)
+    assert payload["total_citations"] is None
+    assert payload["total_references"] is None
+
+
+@pytest.mark.asyncio
+async def test_citation_graph_counts_only_http_error():
+    """A counts-mode HTTP error (e.g. 404 not-found) surfaces via the same Error
+    envelope as the other paths — regression guard for the shared try/except."""
+    failing = MagicMock()
+    failing.status_code = 200
+    failing.headers = {}
+    failing.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "not found", request=MagicMock(), response=MagicMock()
+    )
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=failing)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        response = await handle_citation_graph(
+            {"paper_id": "2401.12345", "counts_only": True}
+        )
+
+    assert response[0].text.startswith("Error:")
+
+
+# --- B11: request pacing ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pace_request_disabled_by_default(monkeypatch):
+    """Default interval (0.0) -> pacing is a no-op (asyncio.sleep never awaited)."""
+    monkeypatch.setattr(
+        citation_graph.settings, "SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL", 0.0
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(citation_graph.asyncio, "sleep", sleep_mock)
+
+    await citation_graph._pace_request()
+
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pace_request_spaces_consecutive_calls(monkeypatch):
+    """A positive interval makes a call wait when a prior request was recent (B11).
+
+    Uses the real monotonic clock (patching the global time.monotonic would break
+    asyncio's event loop); seeds `_next_request_time` ~1s ahead and asserts the
+    pacer sleeps a positive, bounded amount.
+    """
+    monkeypatch.setattr(
+        citation_graph.settings, "SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL", 1.0
+    )
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(citation_graph.asyncio, "sleep", sleep_mock)
+    # Pretend the previous request scheduled the next-allowed time ~1s out.
+    citation_graph._next_request_time = time.monotonic() + 1.0
+    try:
+        await citation_graph._pace_request()
+    finally:
+        citation_graph._next_request_time = 0.0
+
+    sleep_mock.assert_awaited_once()
+    slept = sleep_mock.await_args.args[0]
+    assert 0 < slept <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_pace_request_clamps_huge_interval(monkeypatch):
+    """A misconfigured huge interval is clamped to MAX_PACE_INTERVAL, so a single
+    pacing wait cannot hang the tool (mirrors the Retry-After clamp)."""
+    monkeypatch.setattr(
+        citation_graph.settings, "SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL", 3600.0
+    )
+    citation_graph._next_request_time = 0.0
+    citation_graph._pace_lock = None
+    citation_graph._pace_loop = None
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(citation_graph.asyncio, "sleep", sleep_mock)
+    try:
+        await citation_graph._pace_request()  # schedules next at now + clamp
+        await citation_graph._pace_request()  # must wait <= clamp, NOT 3600
+    finally:
+        citation_graph._next_request_time = 0.0
+        citation_graph._pace_lock = None
+        citation_graph._pace_loop = None
+
+    sleep_mock.assert_awaited_once()
+    assert sleep_mock.await_args.args[0] <= citation_graph.MAX_PACE_INTERVAL
+
+
+@pytest.mark.asyncio
+async def test_pace_request_non_finite_interval_is_noop(monkeypatch):
+    """A non-finite interval (inf / nan) disables pacing instead of hanging."""
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(citation_graph.asyncio, "sleep", sleep_mock)
+    for bad in (float("inf"), float("nan")):
+        monkeypatch.setattr(
+            citation_graph.settings, "SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL", bad
+        )
+        await citation_graph._pace_request()
+    sleep_mock.assert_not_awaited()
+
+
+def test_pace_request_survives_loop_change(monkeypatch):
+    """The per-loop pace lock must not raise 'bound to a different event loop'
+    when pacing runs under two different event loops (cross-vendor finding).
+
+    A module-global asyncio.Lock created once would bind to the first loop and
+    raise on the second asyncio.run; the lazy per-loop lock must not."""
+    monkeypatch.setattr(
+        citation_graph.settings, "SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL", 0.01
+    )
+    citation_graph._next_request_time = 0.0
+    citation_graph._pace_lock = None
+    citation_graph._pace_loop = None
+
+    async def two_contending_calls():
+        # gather() contends the lock so it actually binds to this loop.
+        await asyncio.gather(
+            citation_graph._pace_request(), citation_graph._pace_request()
+        )
+
+    try:
+        asyncio.run(two_contending_calls())  # loop A binds the lock
+        asyncio.run(two_contending_calls())  # loop B must not raise
+    finally:
+        citation_graph._next_request_time = 0.0
+        citation_graph._pace_lock = None
+        citation_graph._pace_loop = None

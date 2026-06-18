@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = ""
     CITATION_MAX_EDGES: int | None = None
     SEMANTIC_SCHOLAR_API_KEY: str | None = None
+    # Minimum seconds between Semantic Scholar requests (0 = no pacing, the
+    # default, preserving exact prior behavior). An authenticated S2 key grants
+    # ~1 request/second across all endpoints; set this to ~1.1 to pace requests
+    # proactively instead of bursting and relying on 429 retry/backoff.
+    SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL: float = 0.0
     model_config = SettingsConfigDict(extra="allow")
 
     @property

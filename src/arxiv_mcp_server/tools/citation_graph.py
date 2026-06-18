@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -63,6 +65,62 @@ def _backoff_delay(retry_after, base_delay, attempt):
     return random.uniform(0, min(base_delay * (2**attempt), MAX_RETRY_DELAY))
 
 
+# --- Request pacing (B11) ---------------------------------------------------
+# An authenticated Semantic Scholar key grants ~1 request/second across all
+# endpoints, so the paginated path's 3 sequential calls otherwise burst past the
+# limit and lean on retry/backoff. When SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL is
+# > 0, space every S2 request by at least that many seconds. The default (0.0)
+# disables pacing, keeping behavior — and timing — exactly as before.
+
+# Upper bound on a single pacing wait, mirroring MAX_RETRY_DELAY: asyncio.sleep
+# is not covered by the httpx timeout, so a fat-fingered interval (e.g. 3600, or
+# a non-finite value) must not be able to stall the tool — and, since the pace
+# lock is held across the sleep, stall every concurrent caller behind it.
+MAX_PACE_INTERVAL = 30.0
+
+_pace_lock: Optional[asyncio.Lock] = None
+_pace_loop: Optional[asyncio.AbstractEventLoop] = None
+_next_request_time = 0.0  # time.monotonic() of the earliest next allowed request
+
+
+def _get_pace_lock() -> asyncio.Lock:
+    """Return a pace lock bound to the *current* running loop.
+
+    A module-global asyncio.Lock binds to the first loop that awaits it; reused
+    from a different loop (a second asyncio.run / a per-test loop) it raises
+    "bound to a different event loop". Create it lazily per running loop instead.
+    Safe without its own guard: there is no await between the check and the
+    assignment, so this runs atomically within a single loop."""
+    global _pace_lock, _pace_loop
+    loop = asyncio.get_running_loop()
+    if _pace_lock is None or _pace_loop is not loop:
+        _pace_lock = asyncio.Lock()
+        _pace_loop = loop
+    return _pace_lock
+
+
+async def _pace_request() -> None:
+    """Throttle S2 requests to >= SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL apart.
+
+    No-op when the interval is <= 0 (the default) or non-finite. Otherwise the
+    interval is clamped to MAX_PACE_INTERVAL and pacing is serialized via a
+    per-loop lock so concurrent callers queue in order rather than all firing at
+    once. The clamp guarantees a single pacing wait cannot hang the tool (or,
+    since the lock is held across it, every concurrent caller)."""
+    interval = settings.SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL or 0.0
+    if not math.isfinite(interval) or interval <= 0:
+        return
+    interval = min(interval, MAX_PACE_INTERVAL)
+    global _next_request_time
+    async with _get_pace_lock():
+        now = time.monotonic()
+        wait = _next_request_time - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+            now = time.monotonic()
+        _next_request_time = now + interval
+
+
 async def _s2_get(client, url, *, headers=None, max_retries=4, base_delay=1.0):
     """GET with backoff on transient failures (S2 rate limits / 5xx / transport).
 
@@ -72,10 +130,14 @@ async def _s2_get(client, url, *, headers=None, max_retries=4, base_delay=1.0):
     jittered exponential backoff. Returns the final response (caller still calls
     raise_for_status()).
 
-    Worst-case blocking per call is bounded by max_retries * MAX_RETRY_DELAY
-    (~64s); the paginated path makes three such calls sequentially."""
+    Worst-case blocking is bounded: each attempt waits at most MAX_PACE_INTERVAL
+    (pacing) plus MAX_RETRY_DELAY (backoff), so a call is bounded by
+    ~max_retries * (MAX_PACE_INTERVAL + MAX_RETRY_DELAY); the paginated path makes
+    three such calls sequentially. Both sleeps are clamped — neither the pacing
+    interval nor a server-supplied Retry-After can hang the tool."""
     response = None
     for attempt in range(max_retries + 1):
+        await _pace_request()
         try:
             response = await client.get(url, headers=headers or {})
         except httpx.TransportError:
@@ -112,9 +174,15 @@ citation_graph_tool = types.Tool(
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     description=(
         "Return papers citing an arXiv paper and papers that it references "
-        "using Semantic Scholar's citation graph. In paginated mode "
-        "(`limit` or `compact` set), `citation_count`/`reference_count` report "
-        "edges returned in the current page; each direction has its own cursor "
+        "using Semantic Scholar's citation graph. NOTE: in the graph modes "
+        "`citation_count`/`reference_count` count the edges RETURNED, not the "
+        "paper's true totals — the default/legacy nested call is capped by "
+        "Semantic Scholar at 1000 per direction, and in paginated mode they "
+        "reflect the current page. For the paper's authoritative totals set "
+        "`counts_only: true`: it returns `total_citations`/`total_references` "
+        "(Semantic Scholar's scalar citationCount/referenceCount) with no edge "
+        "lists — one endpoint, a small fixed payload. In paginated mode "
+        "(`limit` or `compact` set) each direction has its own cursor "
         "(`pagination.citations.next` / `pagination.references.next`) to pass as "
         "the next `offset`. If an output cap is configured (CITATION_MAX_EDGES), "
         "a `truncated` flag is added when results were capped (legacy path only)."
@@ -148,6 +216,15 @@ citation_graph_tool = types.Tool(
                 "description": (
                     "Drop author lists and nested external_ids, return minified "
                     "id+title edges (lower token cost)."
+                ),
+            },
+            "counts_only": {
+                "type": "boolean",
+                "description": (
+                    "Return ONLY the paper's true citation/reference totals as "
+                    "`total_citations`/`total_references` (Semantic Scholar "
+                    "scalar counts) with no edge lists — one endpoint, a small "
+                    "fixed payload. Takes precedence over limit/offset/compact."
                 ),
             },
         },
@@ -197,6 +274,46 @@ def _normalize_paper_items_compact(
             }
         )
     return normalized
+
+
+async def _handle_citation_graph_counts(
+    paper_id: str,
+) -> List[types.TextContent]:
+    """Opt-in counts-only mode: return Semantic Scholar's authoritative scalar
+    citationCount/referenceCount (the paper's TRUE totals) — one endpoint (no
+    citation/reference fan-out), a small fixed payload with no edge lists.
+
+    To avoid one key carrying two meanings, the totals are reported under
+    distinct keys `total_citations`/`total_references` — NOT the graph modes'
+    `citation_count`/`reference_count`, which count the edges *returned* (S2 caps
+    the nested call at 1000 per direction; the paginated path reports the current
+    page). The `paper` block mirrors the minimal compact shape (no authors /
+    external_ids)."""
+    s2_paper_identifier = quote(f"ARXIV:{paper_id}", safe="")
+    url = (
+        f"{SEMANTIC_SCHOLAR_BASE_URL}/{s2_paper_identifier}"
+        "?fields=title,year,citationCount,referenceCount"
+    )
+
+    headers = _auth_headers()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await _s2_get(client, url, headers=headers)
+        response.raise_for_status()
+
+    payload = response.json()
+    result = {
+        "status": "success",
+        "paper": {
+            "paper_id": payload.get("paperId"),
+            "arxiv_id": paper_id,
+            "title": payload.get("title", ""),
+            "year": payload.get("year"),
+        },
+        "counts_only": True,
+        "total_citations": payload.get("citationCount"),
+        "total_references": payload.get("referenceCount"),
+    }
+    return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 async def _handle_citation_graph_paginated(
@@ -327,6 +444,11 @@ async def handle_citation_graph(arguments: Dict[str, Any]) -> List[types.TextCon
         # Strict bool: only a JSON `true` enables compact. Guards against a
         # truthy non-bool (e.g. the string "false") from a non-validating client.
         compact = arguments.get("compact") is True
+        # Strict bool, like compact. counts_only takes precedence over the graph
+        # modes: it returns the paper's true scalar totals (no edge lists).
+        counts_only = arguments.get("counts_only") is True
+        if counts_only:
+            return await _handle_citation_graph_counts(paper_id)
 
         # Pagination is triggered only by `limit` or `compact`. `offset` alone is
         # a no-op here (it falls through to the legacy path, which has no paging);
