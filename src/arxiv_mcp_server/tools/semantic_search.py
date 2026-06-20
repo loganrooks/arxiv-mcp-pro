@@ -59,6 +59,9 @@ semantic_search_tool = types.Tool(
         "IMPORTANT: only searches your local downloaded collection — will return empty results if no papers "
         "have been downloaded yet. Use search_papers to find papers on arXiv, then download_paper to add "
         "them to the local index before using this tool. "
+        "Opt-in pagination: set `offset` to page through ranked results (page size = max_results); "
+        "set `compact` to drop the full abstract from each result and cut token cost. When either is set, "
+        "the response adds `offset`/`total_available`/`next_offset`. Omit both for full, unpaged output. "
         'Requires pro dependencies: uv pip install -e ".[pro]"'
     ),
     inputSchema={
@@ -76,6 +79,15 @@ semantic_search_tool = types.Tool(
                 "type": "integer",
                 "description": "Maximum number of results to return (default: 10).",
                 "default": 10,
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Pagination offset into the ranked results (opt-in; page size = max_results). Omit for the first page.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Drop the full `abstract` from each result to cut token cost; all other fields (id, title, authors, categories, published, score, resource_uri) are kept. Omit for full output.",
             },
         },
         "additionalProperties": False,
@@ -281,7 +293,10 @@ def _load_vectors(exclude_paper_id: Optional[str] = None) -> List[Dict[str, Any]
 
 
 def _rank_by_similarity(
-    query_vector: Any, candidates: List[Dict[str, Any]], max_results: int
+    query_vector: Any,
+    candidates: List[Dict[str, Any]],
+    max_results: int,
+    offset: int = 0,
 ) -> List[IndexedPaper]:
     """Compute cosine similarity (normalized vectors) and rank results."""
     if not candidates:
@@ -290,7 +305,7 @@ def _rank_by_similarity(
     matrix = np.vstack([candidate["vector"] for candidate in candidates])
     similarities = matrix @ np.asarray(query_vector, dtype=np.float32)
 
-    ranked_indices = np.argsort(similarities)[::-1][:max_results]
+    ranked_indices = np.argsort(similarities)[::-1][offset : offset + max_results]
     ranked_results: List[IndexedPaper] = []
 
     for idx in ranked_indices:
@@ -380,6 +395,8 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
         query = (arguments.get("query") or "").strip()
         paper_id = (arguments.get("paper_id") or "").strip()
         max_results = min(int(arguments.get("max_results", 10)), settings.MAX_RESULTS)
+        offset = max(0, int(arguments.get("offset", 0) or 0))
+        compact = bool(arguments.get("compact", False))
 
         if not query and not paper_id:
             return [
@@ -413,25 +430,45 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
             mode = "semantic_query"
             query_payload = query
 
-        ranked = _rank_by_similarity(query_vector, candidates, max_results=max_results)
+        ranked = _rank_by_similarity(
+            query_vector, candidates, max_results=max_results, offset=offset
+        )
+        total_available = len(candidates)
+
+        papers = []
+        for paper in ranked:
+            paper_dict = {
+                "id": paper.paper_id,
+                "title": paper.title,
+                "abstract": paper.abstract,
+                "authors": paper.authors,
+                "categories": paper.categories,
+                "published": paper.published,
+                "score": round(paper.score, 6),
+                "resource_uri": f"arxiv://{paper.paper_id}",
+            }
+            if compact:
+                # pop (not del) so a future change making `abstract` conditional
+                # can't raise a KeyError that the broad except below would swallow.
+                paper_dict.pop("abstract", None)
+            papers.append(paper_dict)
+
+        # PAGINATED MODE = offset > 0 or compact. The default (offset == 0 and not
+        # compact) leaves the response byte-for-byte identical to the legacy shape.
+        paginated = offset > 0 or compact
         response = {
             "mode": mode,
             "query": query_payload,
             "total_results": len(ranked),
-            "papers": [
-                {
-                    "id": paper.paper_id,
-                    "title": paper.title,
-                    "abstract": paper.abstract,
-                    "authors": paper.authors,
-                    "categories": paper.categories,
-                    "published": paper.published,
-                    "score": round(paper.score, 6),
-                    "resource_uri": f"arxiv://{paper.paper_id}",
-                }
-                for paper in ranked
-            ],
         }
+        if paginated:
+            next_offset = offset + len(ranked)
+            response["offset"] = offset
+            response["total_available"] = total_available
+            response["next_offset"] = (
+                next_offset if next_offset < total_available else None
+            )
+        response["papers"] = papers
 
         return [types.TextContent(type="text", text=json.dumps(response, indent=2))]
     except Exception as exc:

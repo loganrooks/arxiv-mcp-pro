@@ -95,6 +95,156 @@ async def test_semantic_search_by_paper_id(semantic_test_env):
     assert all(p["id"] != "2402.00001" for p in payload["papers"])
 
 
+def _index_three_papers():
+    """Index three papers with deterministic, distinct DummyModel rankings.
+
+    Against the query "vision transformer" (DummyModel vector ~ [1, 1, 0]):
+      - 2403.00001 "transformer model for vision" -> [1, 1, 0] -> rank 1
+      - 2403.00002 "vision graph methods"         -> [0, 1, 1] -> rank 2
+      - 2403.00003 "graph neural network"         -> [0, 0, 1] -> rank 3
+    """
+    semantic_module._upsert_index_record(
+        paper_id="2403.00001",
+        title="Vision Transformers",
+        abstract="transformer model for vision",
+        authors=["Author 1"],
+        categories=["cs.CV"],
+    )
+    semantic_module._upsert_index_record(
+        paper_id="2403.00002",
+        title="Vision Graphs",
+        abstract="vision graph methods",
+        authors=["Author 2"],
+        categories=["cs.LG"],
+    )
+    semantic_module._upsert_index_record(
+        paper_id="2403.00003",
+        title="Graph Networks",
+        abstract="graph neural network",
+        authors=["Author 3"],
+        categories=["cs.LG"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_compact_drops_abstract(semantic_test_env):
+    """compact=True omits the abstract key and adds the pagination metadata."""
+    _index_three_papers()
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 3, "compact": True}
+    )
+
+    payload = json.loads(response[0].text)
+    assert payload["total_results"] == 3
+    for paper in payload["papers"]:
+        assert "abstract" not in paper
+        assert "id" in paper
+        assert "title" in paper
+        assert "score" in paper
+    # Paginated mode metadata is present.
+    assert payload["offset"] == 0
+    assert payload["total_available"] == 3
+    # Last page (3 of 3 returned) -> no further page.
+    assert payload["next_offset"] is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_offset_pages(semantic_test_env):
+    """offset=1 returns the 2nd-ranked paper; next_offset advances correctly."""
+    _index_three_papers()
+
+    full = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 3}
+    )
+    full_payload = json.loads(full[0].text)
+    second_ranked_id = full_payload["papers"][1]["id"]
+
+    page = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 1, "offset": 1}
+    )
+    page_payload = json.loads(page[0].text)
+
+    assert page_payload["total_results"] == 1
+    assert page_payload["papers"][0]["id"] == second_ranked_id
+    assert page_payload["offset"] == 1
+    assert page_payload["total_available"] == 3
+    # offset(1) + returned(1) = 2 < total_available(3) -> next page at 2.
+    assert page_payload["next_offset"] == 2
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_default_output_unchanged(semantic_test_env):
+    """No offset/compact: abstracts present, no pagination metadata (legacy)."""
+    _index_three_papers()
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 3}
+    )
+
+    payload = json.loads(response[0].text)
+    assert set(payload.keys()) == {"mode", "query", "total_results", "papers"}
+    for paper in payload["papers"]:
+        assert "abstract" in paper
+    assert "offset" not in payload
+    assert "total_available" not in payload
+    assert "next_offset" not in payload
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_next_offset_null_at_end(semantic_test_env):
+    """An offset that reaches the last page yields next_offset is None."""
+    _index_three_papers()
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 1, "offset": 2}
+    )
+
+    payload = json.loads(response[0].text)
+    assert payload["total_results"] == 1
+    assert payload["offset"] == 2
+    assert payload["total_available"] == 3
+    # offset(2) + returned(1) = 3, not < total_available(3) -> end of results.
+    assert payload["next_offset"] is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_offset_past_end(semantic_test_env):
+    """An offset beyond total_available returns an empty page, not an error or loop."""
+    _index_three_papers()
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 3, "offset": 99}
+    )
+
+    payload = json.loads(response[0].text)
+    assert payload["total_results"] == 0
+    assert payload["papers"] == []
+    assert payload["offset"] == 99
+    assert payload["total_available"] == 3
+    # offset(99) is not < total_available(3) -> no next page (no infinite paging).
+    assert payload["next_offset"] is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_compact_with_offset(semantic_test_env):
+    """compact and offset combine: dropped abstract AND correct pagination cursor."""
+    _index_three_papers()
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 1, "offset": 1, "compact": True}
+    )
+
+    payload = json.loads(response[0].text)
+    assert payload["total_results"] == 1
+    assert "abstract" not in payload["papers"][0]
+    assert payload["papers"][0]["id"]  # still carries identity fields
+    assert payload["offset"] == 1
+    assert payload["total_available"] == 3
+    # offset(1) + returned(1) = 2 < total_available(3) -> next page at 2.
+    assert payload["next_offset"] == 2
+
+
 @pytest.mark.asyncio
 async def test_reindex_uses_local_markdown_ids(
     monkeypatch, semantic_test_env, temp_storage_path

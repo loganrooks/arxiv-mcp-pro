@@ -58,7 +58,12 @@ test = [
     "pytest-asyncio>=0.23.5",
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.10.0",
-    "aioresponses>=0.7.6"
+    "aioresponses>=0.7.6",
+    # numpy is needed for the semantic_search test suite to actually RUN in CI
+    # (the tests `importorskip("numpy")`; it otherwise lives only in the heavy
+    # `pro` extra, so CI silently skipped them). sentence-transformers is NOT
+    # needed — those tests monkeypatch the model.
+    "numpy>=1.26.0"
 ]
 dev = [
     "black>=23.3.0"
