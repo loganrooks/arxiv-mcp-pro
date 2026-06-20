@@ -66,6 +66,25 @@ async def test_check_alerts_returns_new_papers(monkeypatch, alerts_test_env):
     assert payload["alerts"][0]["new_paper_count"] == 1
 
 
+def test_save_watches_atomic_roundtrip_no_temp_leftovers(alerts_test_env):
+    """_save_watches persists atomically: content round-trips and no temp files remain.
+
+    Regression guard for B5 — the write goes through a temp file + os.replace, so an
+    interrupted write can never truncate the live file, and a successful write must
+    not leave a stray .tmp behind.
+    """
+    payload = {"topics": [{"topic": "atomic-write", "categories": ["cs.DC"]}]}
+    alerts_module._save_watches(payload)
+
+    # Content round-trips through the loader.
+    assert alerts_module._load_watches() == payload
+
+    # The atomic rename leaves no stray temp files in the storage dir.
+    storage_dir = alerts_module._watch_file_path().parent
+    leftovers = [p.name for p in storage_dir.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == [], f"atomic write left temp files: {leftovers}"
+
+
 @pytest.mark.asyncio
 async def test_check_alerts_handles_partial_paper_fields(monkeypatch, alerts_test_env):
     """check_alerts must not raise KeyError when a paper entry is missing optional fields."""

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -109,8 +111,32 @@ def _load_watches() -> Dict[str, Any]:
 
 
 def _save_watches(payload: Dict[str, Any]) -> None:
-    """Persist watches to disk."""
-    _watch_file_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    """Persist watches to disk atomically (temp file + rename).
+
+    Writing in place risks a truncated or empty file if the process is
+    interrupted mid-write; ``_load_watches`` would then discard it and silently
+    lose every saved watch. Write to a temp file in the same directory, fsync it,
+    then ``os.replace`` — an atomic rename on POSIX and Windows — so a reader
+    always sees either the complete old file or the complete new one.
+    """
+    watch_file = _watch_file_path()
+    data = json.dumps(payload, indent=2)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=watch_file.parent, prefix=f".{WATCH_FILE_NAME}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, watch_file)
+    except BaseException:
+        # Never leave a stray temp file behind if the write or rename fails.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _now_iso() -> str:
