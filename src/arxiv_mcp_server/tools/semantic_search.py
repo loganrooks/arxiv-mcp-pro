@@ -85,7 +85,7 @@ semantic_search_tool = types.Tool(
             "offset": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "Pagination offset into the ranked results (opt-in; page size = max_results). Omit for the first page.",
+                "description": "Pagination offset into the ranked results (page size = max_results). Send `offset: 0` for page one WITH a cursor (`total_available`/`next_offset`), then follow `next_offset` for later pages. Omit `offset` entirely (with `compact` also unset) for legacy unpaged output and no cursor.",
             },
             "compact": {
                 "type": "boolean",
