@@ -17,7 +17,7 @@ from mcp.types import ToolAnnotations
 
 from ..config import Settings
 
-logger = logging.getLogger("arxiv-mcp-server")
+logger = logging.getLogger("arxiv-mcp-pro")
 settings = Settings()
 
 

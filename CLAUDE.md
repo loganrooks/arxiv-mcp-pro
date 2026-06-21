@@ -32,7 +32,7 @@ python -m pytest -v
 python -m arxiv_mcp_server
 
 # Or via entry point
-arxiv-mcp-server
+arxiv-mcp-pro
 ```
 
 ## Architecture Overview

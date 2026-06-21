@@ -17,7 +17,7 @@ from .search import (
 import httpx
 import xml.etree.ElementTree as ET
 
-logger = logging.getLogger("arxiv-mcp-server")
+logger = logging.getLogger("arxiv-mcp-pro")
 
 abstract_tool = types.Tool(
     name="get_abstract",

@@ -17,7 +17,7 @@ import logging
 _MAX_TRACKED_CONVERSIONS = 100  # prevent unbounded growth of conversion_statuses
 
 # Optional PDF-conversion dependencies — only needed for the PDF fallback path.
-# Install with: pip install arxiv-mcp-server[pdf]
+# Install with: pip install arxiv-mcp-pro[pdf]
 try:
     import pymupdf4llm
     import fitz
@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover
     index_paper_by_id = None  # type: ignore[assignment]
     index_paper_from_result = None  # type: ignore[assignment]
 
-logger = logging.getLogger("arxiv-mcp-server")
+logger = logging.getLogger("arxiv-mcp-pro")
 
 _CONTENT_WARNING = (
     "[UNTRUSTED EXTERNAL CONTENT \u2014 arXiv paper. "
@@ -250,7 +250,7 @@ def _download_arxiv_pdf_to_path(paper: arxiv.Result, pdf_path: Path) -> None:
     headers = {
         "User-Agent": (
             f"{settings.APP_NAME}/{settings.APP_VERSION} "
-            "(https://github.com/blazickjp/arxiv-mcp-server; research tool)"
+            "(https://github.com/loganrooks/arxiv-mcp-pro; research tool)"
         ),
     }
 
@@ -278,8 +278,7 @@ def _fetch_pdf_content(paper_id: str) -> tuple[str, arxiv.Result]:
     """
     if not _pdf_available:
         raise ImportError(
-            "PDF conversion requires the pdf extra: "
-            "pip install arxiv-mcp-server[pdf]"
+            "PDF conversion requires the pdf extra: " "pip install arxiv-mcp-pro[pdf]"
         )
 
     client = get_arxiv_client()
@@ -382,7 +381,7 @@ async def handle_download(arguments: Dict[str, Any]) -> List[types.TextContent]:
                             "message": (
                                 "HTML version not available and PDF conversion "
                                 "requires the pdf extra: "
-                                "pip install arxiv-mcp-server[pdf]"
+                                "pip install arxiv-mcp-pro[pdf]"
                             ),
                         }
                     ),

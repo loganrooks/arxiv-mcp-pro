@@ -35,4 +35,4 @@ else
   UV="uv"
 fi
 
-exec "$UV" run arxiv-mcp-server "$@"
+exec "$UV" run arxiv-mcp-pro "$@"

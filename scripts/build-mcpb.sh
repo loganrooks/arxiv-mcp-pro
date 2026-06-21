@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build an MCPB bundle for arxiv-mcp-server.
-# Outputs: mcpb-build/arxiv-mcp-server-darwin-<arch>-<version>.mcpb
+# Build an MCPB bundle for arxiv-mcp-pro.
+# Outputs: mcpb-build/arxiv-mcp-pro-darwin-<arch>-<version>.mcpb
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,7 +25,7 @@ print(match.group(1))
 PYEOF
 )"
 
-echo "Building arxiv-mcp-server v$VERSION MCPB bundle..."
+echo "Building arxiv-mcp-pro v$VERSION MCPB bundle..."
 
 # Clean and create structure
 rm -rf "$BUILD_DIR"
@@ -112,7 +112,7 @@ if [[ -z "$ARTIFACT" ]]; then
 fi
 
 ARCH="$(uname -m)"
-FINAL_ARTIFACT="$BUILD_DIR/arxiv-mcp-server-darwin-$ARCH-$VERSION.mcpb"
+FINAL_ARTIFACT="$BUILD_DIR/arxiv-mcp-pro-darwin-$ARCH-$VERSION.mcpb"
 if [[ "$ARTIFACT" != "$FINAL_ARTIFACT" ]]; then
   mv "$ARTIFACT" "$FINAL_ARTIFACT"
 fi

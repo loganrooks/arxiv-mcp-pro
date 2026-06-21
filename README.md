@@ -1,30 +1,21 @@
-[![PyPI Version](https://img.shields.io/pypi/v/arxiv-mcp-server.svg)](https://pypi.org/project/arxiv-mcp-server/)
-[![PyPI Downloads](https://img.shields.io/pypi/dm/arxiv-mcp-server.svg)](https://pypi.org/project/arxiv-mcp-server/)
-[![GitHub Stars](https://img.shields.io/github/stars/blazickjp/arxiv-mcp-server?style=flat)](https://github.com/blazickjp/arxiv-mcp-server/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/blazickjp/arxiv-mcp-server?style=flat)](https://github.com/blazickjp/arxiv-mcp-server/forks)
-[![Tests](https://github.com/blazickjp/arxiv-mcp-server/actions/workflows/tests.yml/badge.svg)](https://github.com/blazickjp/arxiv-mcp-server/actions/workflows/tests.yml)
+[![Tests](https://github.com/loganrooks/arxiv-mcp-pro/actions/workflows/tests.yml/badge.svg)](https://github.com/loganrooks/arxiv-mcp-pro/actions/workflows/tests.yml)
+[![GitHub Stars](https://img.shields.io/github/stars/loganrooks/arxiv-mcp-pro?style=flat)](https://github.com/loganrooks/arxiv-mcp-pro/stargazers)
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![smithery badge](https://smithery.ai/badge/arxiv-mcp-server)](https://smithery.ai/server/arxiv-mcp-server)
-[![Install in VS Code](https://img.shields.io/badge/Install_in-VS_Code-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect/mcp/install?name=arxiv-mcp-server&config=%7B%22type%22%3A%22stdio%22%2C%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22arxiv-mcp-server%22%5D%7D)
-[![Install in VS Code Insiders](https://img.shields.io/badge/Install_in-VS_Code_Insiders-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=arxiv-mcp-server&config=%7B%22type%22%3A%22stdio%22%2C%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22arxiv-mcp-server%22%5D%7D&quality=insiders)
-[![Add to Kiro](https://kiro.dev/images/add-to-kiro.svg)](https://kiro.dev/launch/mcp/add?name=arxiv-mcp-server&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22arxiv-mcp-server%22%5D%7D)
 [![Codex Plugin](https://img.shields.io/badge/Codex-Plugin-412991?style=flat-square)](./.codex-plugin/plugin.json)
 
-# ArXiv MCP Server
+# ArXiv MCP Pro
 
-<!-- mcp-name: io.github.blazickjp/arxiv-mcp-server -->
+<!-- mcp-name: io.github.loganrooks/arxiv-mcp-pro -->
 
-> 🔍 Enable AI assistants to search and access arXiv papers through a simple MCP interface.
+> 🔍 The efficient, reliable, citation-capable arXiv MCP server — a token-frugal, standalone evolution of [`arxiv-mcp-server`](https://github.com/blazickjp/arxiv-mcp-server) by Joseph Blazick (Pearl Labs).
 
-The ArXiv MCP Server provides a bridge between AI assistants and arXiv's research repository through the Model Context Protocol (MCP). It allows AI models to search for papers and access their content in a programmatic way.
+ArXiv MCP Pro provides a bridge between AI assistants and arXiv's research repository through the Model Context Protocol (MCP). It lets AI models search for papers and access their content programmatically — with token-frugal, paginated outputs and citation tooling layered on the original server's foundation.
 
 <div align="center">
   
-🤝 **[Contribute](https://github.com/blazickjp/arxiv-mcp-server/blob/main/CONTRIBUTING.md)** • 
-📝 **[Report Bug](https://github.com/blazickjp/arxiv-mcp-server/issues)**
-
-<a href="https://www.pulsemcp.com/servers/blazickjp-arxiv-mcp-server"><img src="https://www.pulsemcp.com/badge/top-pick/blazickjp-arxiv-mcp-server" width="400" alt="Pulse MCP Badge"></a>
+🤝 **[Contribute](https://github.com/loganrooks/arxiv-mcp-pro/pulls)** • 
+📝 **[Report Bug](https://github.com/loganrooks/arxiv-mcp-pro/issues)**
 </div>
 
 ## ✨ Core Features
@@ -54,7 +45,7 @@ Agentic AI framework as **AG01: Prompt Injection in LLM-Integrated Systems**.
 ### Recommended Mitigations
 
 1. **Use read-only MCP configurations** — where possible, configure the MCP
-   client so that the arxiv-mcp-server cannot trigger write operations or invoke
+   client so that the arxiv-mcp-pro server cannot trigger write operations or invoke
    other tools on your behalf.
 2. **Review paper content before acting on AI summaries** — if an AI summary
    asks you to run commands or visit external URLs that were not part of your
@@ -75,74 +66,40 @@ Agentic AI framework as **AG01: Prompt Injection in LLM-Integrated Systems**.
 
 ## 🚀 Quick Start
 
-### Installing via Smithery
+### Install from source
 
-To install ArXiv Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/arxiv-mcp-server):
-
-```bash
-npx -y @smithery/cli install arxiv-mcp-server --client claude
-```
-
-### Installing via Claude Desktop (.mcpb)
-
-The `.mcpb` bundle is the one-click install path for Claude Desktop on macOS. It bundles the server code and Python package dependencies, so users do not need `uv`, `pip`, or manual MCP JSON configuration. Python 3.11+ must still be available on the user's machine.
-
-1. Download the artifact matching your Mac from the [latest release](https://github.com/blazickjp/arxiv-mcp-server/releases/latest):
-   - Apple Silicon: `arxiv-mcp-server-darwin-arm64-<version>.mcpb`
-   - Intel: `arxiv-mcp-server-darwin-x86_64-<version>.mcpb`
-2. In Claude Desktop open **Settings → Extensions** (or drag-and-drop the file onto the Claude Desktop window).
-3. Click **Install** and, when prompted, set your preferred paper storage directory (defaults to `~/.arxiv-mcp-server/papers`).
-
-Claude Desktop launches the bundled server over stdio — no configuration file edits needed.
-
-### Installing Manually
-
-> **Important — use `uv tool install`, not npm/pnpm or `uv pip install`**
->
-> This project publishes the supported server as a Python package on PyPI.
-> Do **not** install `arxiv-mcp-server` with `npm install`, `pnpm add`, or
-> `npx arxiv-mcp-server`: the npm package with this name is an unrelated
-> third-party package and has its own Python-detection wrapper.
->
-> Running `uv pip install arxiv-mcp-server` installs the package into the
-> current virtual environment but does **not** place the `arxiv-mcp-server`
-> executable on your `PATH`.  You must use `uv tool install` so that uv
-> creates an isolated environment and exposes the executable globally:
+> **Install status.** `arxiv-mcp-pro` runs from source today. A published PyPI package
+> (`uvx arxiv-mcp-pro`) and a one-click Claude Desktop `.mcpb` bundle are planned for a
+> future release — until then, use the from-source setup below.
 
 ```bash
-uv tool install arxiv-mcp-server
-```
+# Clone the repository
+git clone https://github.com/loganrooks/arxiv-mcp-pro.git
+cd arxiv-mcp-pro
 
-After this, the `arxiv-mcp-server` command will be available on your `PATH`.
-
-> **PDF fallback (older papers):** Most arXiv papers have an HTML version which
-> the base install handles automatically. For older papers that only have a PDF,
-> the server needs the `[pdf]` extra (pymupdf4llm). Install it with:
->
-> ```bash
-> uv tool install 'arxiv-mcp-server[pdf]'
-> ```
-You can verify it with:
-
-```bash
-arxiv-mcp-server --help
-```
-
-If you previously ran `uv pip install arxiv-mcp-server` and the command is
-missing, uninstall it and re-install with `uv tool install` as shown above.
-
-For development:
-
-```bash
-# Clone and set up development environment
-git clone https://github.com/blazickjp/arxiv-mcp-server.git
-cd arxiv-mcp-server
-
-# Create and activate virtual environment
+# Create and activate a virtual environment
 uv venv
 source .venv/bin/activate
 
-# Install with test dependencies (development only — no global executable)
+# Install (add the [pdf] extra for older, PDF-only papers)
+uv pip install -e .
+# or, with PDF support:
+uv pip install -e ".[pdf]"
+```
+
+Verify the install:
+
+```bash
+arxiv-mcp-pro --help
+```
+
+> **PDF fallback (older papers):** Most arXiv papers have an HTML version handled
+> automatically. Older papers that only have a PDF need the `[pdf]` extra
+> (pymupdf4llm) — install it with `uv pip install -e ".[pdf]"` as shown above.
+
+For development, install the test extra:
+
+```bash
 uv pip install -e ".[test]"
 ```
 
@@ -159,8 +116,8 @@ this README:
 {
   "mcpServers": {
     "arxiv": {
-      "command": "uvx",
-      "args": ["arxiv-mcp-server"]
+      "command": "sh",
+      "args": ["scripts/run-server.sh"]
     }
   }
 }
@@ -172,17 +129,19 @@ If your Codex client supports plugin manifests, point it at
 
 ### 🔌 MCP Integration
 
-Add this configuration to your MCP client config file:
+Until the PyPI package ships, point your MCP client at your local clone with
+`uv --directory`:
 
 ```json
 {
     "mcpServers": {
-        "arxiv-mcp-server": {
+        "arxiv": {
             "command": "uv",
             "args": [
-                "tool",
+                "--directory",
+                "/path/to/cloned/arxiv-mcp-pro",
                 "run",
-                "arxiv-mcp-server",
+                "arxiv-mcp-pro",
                 "--storage-path", "/path/to/paper/storage"
             ]
         }
@@ -190,18 +149,17 @@ Add this configuration to your MCP client config file:
 }
 ```
 
-For Development:
+Once `arxiv-mcp-pro` is published to PyPI, the simpler `uv tool run` form will also work:
 
 ```json
 {
     "mcpServers": {
-        "arxiv-mcp-server": {
+        "arxiv": {
             "command": "uv",
             "args": [
-                "--directory",
-                "path/to/cloned/arxiv-mcp-server",
+                "tool",
                 "run",
-                "arxiv-mcp-server",
+                "arxiv-mcp-pro",
                 "--storage-path", "/path/to/paper/storage"
             ]
         }
@@ -214,7 +172,7 @@ For Development:
 For server deployments where stdio is not practical, run the server with Streamable HTTP:
 
 ```bash
-TRANSPORT=http HOST=127.0.0.1 PORT=8080 arxiv-mcp-server --storage-path /path/to/papers
+TRANSPORT=http HOST=127.0.0.1 PORT=8080 arxiv-mcp-pro --storage-path /path/to/papers
 ```
 
 Then configure an MCP client that supports Streamable HTTP:
@@ -222,7 +180,7 @@ Then configure an MCP client that supports Streamable HTTP:
 ```json
 {
     "mcpServers": {
-        "arxiv-mcp-server": {
+        "arxiv": {
             "type": "http",
             "url": "http://127.0.0.1:8080/mcp"
         }
@@ -287,7 +245,7 @@ result = await call_tool("download_paper", {
 })
 ```
 
-> For older papers that only have a PDF, install the `[pdf]` extra: `uv tool install 'arxiv-mcp-server[pdf]'`
+> For older papers that only have a PDF, install the `[pdf]` extra: `uv pip install -e ".[pdf]"`
 
 ### 3. List Papers
 List all papers downloaded locally. Returns arXiv IDs only — use `read_paper` to access content.
@@ -461,7 +419,7 @@ Released under the Apache License 2.0. See the LICENSE file for details.
 
 <div align="center">
 
-Made with ❤️ by the Pearl Labs Team
-
-<a href="https://glama.ai/mcp/servers/04dtxi5i5n"><img width="380" height="200" src="https://glama.ai/mcp/servers/04dtxi5i5n/badge" alt="ArXiv Server MCP server" /></a>
+**arxiv-mcp-pro** is maintained by [Logan Rooks](https://github.com/loganrooks) and builds on
+[`arxiv-mcp-server`](https://github.com/blazickjp/arxiv-mcp-server), originally created by
+Joseph Blazick and the Pearl Labs Team. Released under Apache-2.0.
 </div>

@@ -7,7 +7,7 @@ from pathlib import Path
 import logging
 
 try:
-    _PACKAGE_VERSION = version("arxiv-mcp-server")
+    _PACKAGE_VERSION = version("arxiv-mcp-pro")
 except PackageNotFoundError:
     _PACKAGE_VERSION = "0.0.0"
 
@@ -36,7 +36,7 @@ def get_arxiv_client(page_size: int = 100):
 class Settings(BaseSettings):
     """Server configuration settings."""
 
-    APP_NAME: str = "arxiv-mcp-server"
+    APP_NAME: str = "arxiv-mcp-pro"
     APP_VERSION: str = _PACKAGE_VERSION
     MAX_RESULTS: int = 50
     BATCH_SIZE: int = 20

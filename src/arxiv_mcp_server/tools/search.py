@@ -14,7 +14,7 @@ import mcp.types as types
 from mcp.types import ToolAnnotations
 from ..config import Settings, get_arxiv_client
 
-logger = logging.getLogger("arxiv-mcp-server")
+logger = logging.getLogger("arxiv-mcp-pro")
 settings = Settings()
 
 # Module-level rate limiter: arXiv asks for >= 3s between requests
@@ -23,7 +23,7 @@ _request_lock = asyncio.Lock()
 _MIN_REQUEST_INTERVAL = 3.0  # seconds
 
 ARXIV_HEADERS = {
-    "User-Agent": "arxiv-mcp-server/0.4.1 (https://github.com/blazickjp/arxiv-mcp-server; research tool)"
+    "User-Agent": "arxiv-mcp-pro/0.6.0 (https://github.com/loganrooks/arxiv-mcp-pro; research tool)"
 }
 
 

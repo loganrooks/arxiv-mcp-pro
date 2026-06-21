@@ -27,7 +27,7 @@ try:
 except ImportError:  # pragma: no cover - handled gracefully in runtime checks
     SentenceTransformer = None  # type: ignore[assignment]
 
-logger = logging.getLogger("arxiv-mcp-server")
+logger = logging.getLogger("arxiv-mcp-pro")
 settings = Settings()
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"

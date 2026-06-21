@@ -1,9 +1,9 @@
 ---
-name: arxiv-mcp-server
+name: arxiv-mcp-pro
 description: Search arXiv papers, download full text, follow citations, and run local semantic search.
 ---
 
-# arXiv MCP Server
+# arXiv MCP Pro
 
 Use this server when you want research-grade access to arXiv from a Codex-compatible MCP client.
 
@@ -15,6 +15,6 @@ Use this server when you want research-grade access to arXiv from a Codex-compat
 - Monitor topics for new papers with alerts
 
 ## Install/runtime
-- Package: `arxiv-mcp-server`
-- Runtime: `uvx arxiv-mcp-server`
+- Package: `arxiv-mcp-pro`
+- Runtime: `uvx arxiv-mcp-pro`
 - MCP config: `../.mcp.json`

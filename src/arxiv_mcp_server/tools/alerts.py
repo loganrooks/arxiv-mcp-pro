@@ -18,7 +18,7 @@ from dateutil import parser
 from ..config import Settings
 from .search import _raw_arxiv_search
 
-logger = logging.getLogger("arxiv-mcp-server")
+logger = logging.getLogger("arxiv-mcp-pro")
 settings = Settings()
 
 WATCH_FILE_NAME = "watched_topics.json"

@@ -6,17 +6,15 @@ Only the current release is actively supported with security updates.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.3.2   | :white_check_mark: |
-| < 0.3.2 | :x:                |
+| 0.6.0   | :white_check_mark: |
+| < 0.6.0 | :x:                |
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in arxiv-mcp-server, please report it by
-sending an email to:
-
-  joe.blazick@yahoo.com
-
-Subject line: SECURITY: arxiv-mcp-server
+If you discover a security vulnerability in arxiv-mcp-pro, please report it
+privately using GitHub's **Report a vulnerability** workflow on this repository
+(the **Security** tab → **Report a vulnerability**), which opens a private
+advisory visible only to the maintainers.
 
 Please include a description of the issue, steps to reproduce, and any relevant
 details about your environment. Do not open a public GitHub issue for security

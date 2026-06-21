@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "arxiv-mcp-server"
-version = "0.5.0"
+name = "arxiv-mcp-pro"
+version = "0.6.0"
 description = "A flexible arXiv search and analysis service with MCP protocol support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,9 @@ classifiers = [
 authors = [
     { name = "Joseph Blazick", email = "blazickjp@amazon.com" }
 ]
+maintainers = [
+    { name = "Logan Rooks" }
+]
 dependencies = [
     "arxiv>=2.1.0",
     "httpx>=0.24.0",
@@ -44,9 +47,9 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/blazickjp/arxiv-mcp-server"
-Issues = "https://github.com/blazickjp/arxiv-mcp-server/issues"
-Documentation = "https://github.com/blazickjp/arxiv-mcp-server#readme"
+Repository = "https://github.com/loganrooks/arxiv-mcp-pro"
+Issues = "https://github.com/loganrooks/arxiv-mcp-pro/issues"
+Documentation = "https://github.com/loganrooks/arxiv-mcp-pro#readme"
 
 [project.optional-dependencies]
 pdf = [
@@ -75,6 +78,8 @@ testpaths = ["tests"]
 addopts = "-v --cov=arxiv_mcp_server"
 
 [project.scripts]
+arxiv-mcp-pro = "arxiv_mcp_server:main"
+# Back-compat alias: existing MCP configs invoking `arxiv-mcp-server` keep working.
 arxiv-mcp-server = "arxiv_mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
