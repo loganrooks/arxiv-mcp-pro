@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,9 @@ semantic_search_tool = types.Tool(
         "IMPORTANT: only searches your local downloaded collection — will return empty results if no papers "
         "have been downloaded yet. Use search_papers to find papers on arXiv, then download_paper to add "
         "them to the local index before using this tool. "
+        "Opt-in pagination: set `offset` to page through ranked results (page size = max_results); "
+        "set `compact` to drop the full abstract from each result and cut token cost. When either is set, "
+        "the response adds `offset`/`total_available`/`next_offset`. Omit both for full, unpaged output. "
         'Requires pro dependencies: uv pip install -e ".[pro]"'
     ),
     inputSchema={
@@ -74,8 +78,18 @@ semantic_search_tool = types.Tool(
             },
             "max_results": {
                 "type": "integer",
+                "minimum": 0,
                 "description": "Maximum number of results to return (default: 10).",
                 "default": 10,
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Pagination offset into the ranked results (page size = max_results). Send `offset: 0` for page one WITH a cursor (`total_available`/`next_offset`), then follow `next_offset` for later pages. Omit `offset` entirely (with `compact` also unset) for legacy unpaged output and no cursor.",
+            },
+            "compact": {
+                "type": "boolean",
+                "description": "Drop the full `abstract` from each result to cut token cost; all other fields (id, title, authors, categories, published, score, resource_uri) are kept. Omit for full output.",
             },
         },
         "additionalProperties": False,
@@ -121,21 +135,28 @@ def _db_path() -> Path:
 def _connect() -> sqlite3.Connection:
     """Open SQLite connection and ensure schema exists."""
     conn = sqlite3.connect(_db_path())
-    conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS semantic_index (
-            paper_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            abstract TEXT NOT NULL,
-            authors_json TEXT NOT NULL,
-            categories_json TEXT NOT NULL,
-            published TEXT,
-            embedding BLOB NOT NULL,
-            embedding_dim INTEGER NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """)
-    conn.commit()
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS semantic_index (
+                paper_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                abstract TEXT NOT NULL,
+                authors_json TEXT NOT NULL,
+                categories_json TEXT NOT NULL,
+                published TEXT,
+                embedding BLOB NOT NULL,
+                embedding_dim INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """)
+        conn.commit()
+    except Exception:
+        # Schema init failed after the connection opened — close it rather than
+        # leak it. Callers use `with closing(_connect())`, which never receives
+        # (and so never closes) the connection if _connect raises mid-setup.
+        conn.close()
+        raise
     return conn
 
 
@@ -171,7 +192,7 @@ def _upsert_index_record(
     embedding = _embed_text(abstract)
     embedding_array = np.asarray(embedding, dtype=np.float32)
 
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         conn.execute(
             """
             INSERT INTO semantic_index (
@@ -253,7 +274,7 @@ def index_paper_from_result(paper: Any) -> bool:
 
 def _load_vectors(exclude_paper_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Load all vectors (optionally excluding one paper)."""
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         if exclude_paper_id:
             rows = conn.execute(
                 "SELECT * FROM semantic_index WHERE paper_id != ?", (exclude_paper_id,)
@@ -281,7 +302,10 @@ def _load_vectors(exclude_paper_id: Optional[str] = None) -> List[Dict[str, Any]
 
 
 def _rank_by_similarity(
-    query_vector: Any, candidates: List[Dict[str, Any]], max_results: int
+    query_vector: Any,
+    candidates: List[Dict[str, Any]],
+    max_results: int,
+    offset: int = 0,
 ) -> List[IndexedPaper]:
     """Compute cosine similarity (normalized vectors) and rank results."""
     if not candidates:
@@ -290,7 +314,7 @@ def _rank_by_similarity(
     matrix = np.vstack([candidate["vector"] for candidate in candidates])
     similarities = matrix @ np.asarray(query_vector, dtype=np.float32)
 
-    ranked_indices = np.argsort(similarities)[::-1][:max_results]
+    ranked_indices = np.argsort(similarities)[::-1][offset : offset + max_results]
     ranked_results: List[IndexedPaper] = []
 
     for idx in ranked_indices:
@@ -312,7 +336,7 @@ def _rank_by_similarity(
 
 def _get_indexed_paper_vector(paper_id: str) -> Optional[Any]:
     """Fetch an indexed vector for a specific paper."""
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         row = conn.execute(
             "SELECT embedding, embedding_dim FROM semantic_index WHERE paper_id = ?",
             (paper_id,),
@@ -337,7 +361,7 @@ def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
     )
 
     if clear_existing:
-        with _connect() as conn:
+        with closing(_connect()) as conn:
             conn.execute("DELETE FROM semantic_index")
             conn.commit()
 
@@ -379,7 +403,21 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
 
         query = (arguments.get("query") or "").strip()
         paper_id = (arguments.get("paper_id") or "").strip()
-        max_results = min(int(arguments.get("max_results", 10)), settings.MAX_RESULTS)
+        # Clamp to [0, MAX_RESULTS]: a negative max_results would otherwise feed a
+        # negative slice bound into _rank_by_similarity (offset:offset+max_results),
+        # producing surprising pages/cursors. 0 stays valid (empty page).
+        max_results = min(
+            max(0, int(arguments.get("max_results", 10))), settings.MAX_RESULTS
+        )
+        # Capture whether `offset` was explicitly provided (even as 0): an
+        # explicit offset opts into paginated mode so the client gets cursor
+        # metadata to page forward. `offset` omitted (or null) stays legacy.
+        offset_arg = arguments.get("offset")
+        offset = max(0, int(offset_arg or 0))
+        # Strict boolean (like citation_graph's `compact`/`counts_only`): a string
+        # such as "false" is truthy under bool(), which would silently drop every
+        # abstract and switch into paginated mode.
+        compact = arguments.get("compact") is True
 
         if not query and not paper_id:
             return [
@@ -413,25 +451,51 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
             mode = "semantic_query"
             query_payload = query
 
-        ranked = _rank_by_similarity(query_vector, candidates, max_results=max_results)
+        ranked = _rank_by_similarity(
+            query_vector, candidates, max_results=max_results, offset=offset
+        )
+        total_available = len(candidates)
+
+        papers = []
+        for paper in ranked:
+            paper_dict = {
+                "id": paper.paper_id,
+                "title": paper.title,
+                "abstract": paper.abstract,
+                "authors": paper.authors,
+                "categories": paper.categories,
+                "published": paper.published,
+                "score": round(paper.score, 6),
+                "resource_uri": f"arxiv://{paper.paper_id}",
+            }
+            if compact:
+                # pop (not del) so a future change making `abstract` conditional
+                # can't raise a KeyError that the broad except below would swallow.
+                paper_dict.pop("abstract", None)
+            papers.append(paper_dict)
+
+        # PAGINATED MODE = `offset` explicitly provided (even 0) or `compact`.
+        # Only the default — `offset` omitted AND not compact — leaves the
+        # response byte-for-byte identical to the legacy shape. An explicit
+        # `offset: 0` is a deliberate opt-in: unlike citation_graph there is no
+        # separate `limit` param to trigger pagination while starting at 0.
+        paginated = offset_arg is not None or compact
         response = {
             "mode": mode,
             "query": query_payload,
             "total_results": len(ranked),
-            "papers": [
-                {
-                    "id": paper.paper_id,
-                    "title": paper.title,
-                    "abstract": paper.abstract,
-                    "authors": paper.authors,
-                    "categories": paper.categories,
-                    "published": paper.published,
-                    "score": round(paper.score, 6),
-                    "resource_uri": f"arxiv://{paper.paper_id}",
-                }
-                for paper in ranked
-            ],
         }
+        if paginated:
+            next_offset = offset + len(ranked)
+            response["offset"] = offset
+            response["total_available"] = total_available
+            # Only emit a cursor when this page actually returned results. An empty
+            # page (e.g. max_results=0, or offset past the end) must not point a
+            # client back at the same offset, or it loops forever.
+            response["next_offset"] = (
+                next_offset if ranked and next_offset < total_available else None
+            )
+        response["papers"] = papers
 
         return [types.TextContent(type="text", text=json.dumps(response, indent=2))]
     except Exception as exc:
