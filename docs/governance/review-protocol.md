@@ -38,6 +38,33 @@ thread, with reviewer attribution. A PR is not merged with unresolved threads.
 See the skill for the full vocabulary, worked examples, and the GitHub
 resolve-thread commands.
 
+## The merge gate (enforced on `main`, not left to memory)
+
+For any change routed to a **cross-vendor review** (the higher-risk row above),
+all of the following must hold before merge. The parts marked *enforced* are
+enforced by GitHub branch protection on `main`, so the loop cannot skip them:
+
+1. **A completed `chatgpt-codex-connector` review on the merge commit.** The
+   cross-vendor pass is a second model lineage (Codex/GPT) and catches what a
+   Claude-only panel shares blind spots on (it is *why* the higher-risk row
+   exists). If the connector wedges or returns nothing — a known runtime risk —
+   **re-trigger it**; a both-tier change does not merge on the Claude-side
+   review alone. (If the connector is persistently unavailable, that is an
+   escalation to the maintainer, not a silent waiver.)
+2. **Every review thread resolved with a typed `review-verdict` block**
+   *(enforced: "require conversation resolution before merging")*. A thread is
+   resolved only after its finding carries a disposition from the 8-verdict
+   vocabulary.
+3. **All required status checks green** *(enforced: `gates` · `lint` · the
+   `test` matrix across 3.11/3.12 × ubuntu/macos/windows)*.
+
+Branch protection on `main` also **requires a pull request before merging** with
+0 required approvals: this is a solo-maintainer repo, so a required *approving*
+review would deadlock (GitHub forbids approving your own PR). The cross-vendor
+connector review is the deliberate substitute for that second set of eyes, and
+the conversation-resolution gate is what makes "all its findings dispositioned"
+a hard precondition rather than a good intention.
+
 ## Gates (enforced by `.pre-commit-config.yaml` + `.github/workflows/ci.yml`)
 
 - `black --check` — formatting.
