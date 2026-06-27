@@ -58,8 +58,13 @@ except ImportError:  # pragma: no cover - handled gracefully in the runtime chec
 
 logger = logging.getLogger("arxiv-mcp-pro")
 
-# Semantic Scholar batch endpoint accepts at most 500 ids per request.
-S2_BATCH_MAX_IDS = 500
+# Semantic Scholar's batch endpoint accepts up to 500 ids per request, but it is
+# ALSO bounded by response size — and we request `references.externalIds`, whose
+# nested lists inflate the payload, so a 500-id chunk can exceed that size limit
+# and fail the whole panel. Chunk conservatively at 100 (a handful of extra 1-RPS
+# calls for a large library, vs an all-or-nothing failure). Flagged independently
+# by the Opus + Codex reviews; the exact safe ceiling is a live-verification item.
+S2_BATCH_MAX_IDS = 100
 
 # Fields requested from the batch endpoint. `references.externalIds` carries
 # each reference's identifiers (we look for the `ArXiv` external id) to build
