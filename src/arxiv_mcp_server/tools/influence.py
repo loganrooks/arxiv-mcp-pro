@@ -50,6 +50,11 @@ try:  # pragma: no cover - exercised via the runtime check / monkeypatched flag
 except ImportError:  # pragma: no cover - handled gracefully in the runtime check
     nx = None  # type: ignore[assignment]
 
+try:  # pragma: no cover - probed only; networkx.pagerank needs scipy at runtime
+    import scipy as _scipy
+except ImportError:  # pragma: no cover - handled gracefully in the runtime check
+    _scipy = None  # type: ignore[assignment]
+
 logger = logging.getLogger("arxiv-mcp-pro")
 
 # Semantic Scholar batch endpoint accepts at most 500 ids per request.
@@ -175,11 +180,14 @@ def _text_has_code(text: str) -> bool:
 
 
 def _extract_arxiv_references(s2_paper: Dict[str, Any]) -> List[str]:
-    """Pull the ArXiv ids of a paper's references from an S2 batch entry.
+    """Pull the canonical ArXiv ids of a paper's references from an S2 entry.
 
     Each reference is an S2 paper stub; we read its `externalIds.ArXiv` (the
     batch endpoint returns `references.externalIds`). References without an
-    ArXiv id are skipped (they cannot be local-library nodes in v1)."""
+    ArXiv id are skipped (they cannot be local-library nodes in v1). The id is
+    normalized to its unversioned form so BOTH sides of the induced-edge join
+    are canonical — S2 may return a versioned reference id (e.g. `2401.0002v1`)
+    that must still match the canonical library node `2401.0002`."""
     references = s2_paper.get("references") or []
     arxiv_ids: List[str] = []
     for reference in references:
@@ -188,7 +196,7 @@ def _extract_arxiv_references(s2_paper: Dict[str, Any]) -> List[str]:
         external_ids = reference.get("externalIds") or {}
         arxiv_id = external_ids.get("ArXiv") if isinstance(external_ids, dict) else None
         if arxiv_id:
-            arxiv_ids.append(str(arxiv_id))
+            arxiv_ids.append(_normalize_arxiv_id(str(arxiv_id)))
     return arxiv_ids
 
 
@@ -265,7 +273,11 @@ def build_influence_rows(
     the disagreement is undefined without a global citation count, so it is
     NOT fabricated as an inflated positive (which would let an absent-from-S2
     paper masquerade as a hidden gem). Such papers still participate in the
-    PageRank ranking and still appear as rows.
+    PageRank ranking and still appear as rows. Likewise the delta is null when
+    `local_citations` is 0: a zero-in-degree paper is tied at the PageRank
+    dangling floor, so its ordinal rank would be decided alphabetically and the
+    delta there is noise, not signal. The raw `pagerank` floor value is still
+    reported for those rows.
 
     NOTE on the spec wording: the design states the delta as "rank-by-pagerank
     position MINUS rank-by-global-citations position". That equals the formula
@@ -287,9 +299,14 @@ def build_influence_rows(
             if reference_id in library_set and reference_id != arxiv_id:
                 graph.add_edge(arxiv_id, reference_id)
 
-    pagerank = _compute_pagerank(graph)
+    # Round PageRank ONCE up front and use the same rounded value everywhere —
+    # the ordinal ranking that feeds the delta, the emitted `pagerank`, and the
+    # row sort — so the displayed order can never disagree with the delta's
+    # implied pagerank_rank within 1e-6.
+    raw_pagerank = _compute_pagerank(graph)
+    pagerank = {aid: round(float(raw_pagerank.get(aid, 0.0)), 6) for aid in library_ids}
 
-    pagerank_rank = _ordinal_ranks(library_ids, key=lambda aid: pagerank.get(aid, 0.0))
+    pagerank_rank = _ordinal_ranks(library_ids, key=lambda aid: pagerank[aid])
 
     def _global_citation_value(arxiv_id: str) -> float:
         entry = s2_data.get(arxiv_id) or {}
@@ -300,28 +317,38 @@ def build_influence_rows(
     global_rank = _ordinal_ranks(library_ids, key=_global_citation_value)
 
     rows: List[Dict[str, Any]] = []
+    zero_indegree_nulled = False
     for arxiv_id in library_ids:
         s2_paper = s2_data.get(arxiv_id) or {}
         global_citations = s2_paper.get("citationCount")
         has_global = isinstance(global_citations, (int, float))
+        local_citations = int(graph.in_degree(arxiv_id))
+
+        # The delta is only meaningful for a paper with BOTH a global count and
+        # at least one in-library citation. A null global count makes the
+        # disagreement undefined (don't fabricate a hidden gem). A zero-in-degree
+        # paper sits at the PageRank dangling floor, tied with every other
+        # zero-in-degree paper, so its ordinal rank — hence the delta — is
+        # decided alphabetically by arXiv id: noise, not signal. Null it; the
+        # raw `pagerank` floor value is still reported as an honest reading.
+        if has_global and local_citations > 0:
+            delta: Optional[int] = global_rank[arxiv_id] - pagerank_rank[arxiv_id]
+        else:
+            delta = None
+            if local_citations == 0:
+                zero_indegree_nulled = True
+
         rows.append(
             {
                 "arxiv_id": arxiv_id,
                 "title": s2_paper.get("title") or "",
-                "pagerank": round(float(pagerank.get(arxiv_id, 0.0)), 6),
-                "local_citations": int(graph.in_degree(arxiv_id)),
+                "pagerank": pagerank[arxiv_id],
+                "local_citations": local_citations,
                 "global_citations": global_citations,
                 "influential_citations": s2_paper.get("influentialCitationCount"),
                 "max_author_hindex": _max_author_hindex(s2_paper),
                 "has_code": bool(has_code_map.get(arxiv_id, False)),
-                # Null global count -> null delta: the disagreement signal is
-                # undefined without a global citation count, so we do not emit
-                # an inflated positive that would masquerade as a hidden gem.
-                "local_vs_global_delta": (
-                    global_rank[arxiv_id] - pagerank_rank[arxiv_id]
-                    if has_global
-                    else None
-                ),
+                "local_vs_global_delta": delta,
             }
         )
 
@@ -342,6 +369,12 @@ def build_influence_rows(
             "Induced citation edges are best-effort: the Semantic Scholar batch "
             "endpoint may cap the number of references returned per paper, so "
             "some edges among your library may be missing."
+        )
+    if zero_indegree_nulled:
+        notes.append(
+            "local_vs_global_delta is only meaningful for papers cited at least "
+            "once within your library; papers with local_citations == 0 have a "
+            "null delta."
         )
 
     return {
@@ -395,19 +428,32 @@ async def _fetch_s2_batch(
     Chunked to S2_BATCH_MAX_IDS per request. The batch endpoint returns a list
     aligned by index with the input ids, with a null entry for any id S2 has no
     record of. Returns arXiv id -> S2 entry (or None). This is the injectable
-    network seam: tests monkeypatch this function so no real HTTP happens."""
+    network seam: tests monkeypatch this function so no real HTTP happens.
+
+    The timeout is 60s (vs citation_graph's 30s single-paper calls): one batch
+    call fans the WHOLE library plus nested `references.externalIds`, so the
+    payload can be large. The exact response size — and whether S2 caps
+    references per paper in batch mode — is a live-verification item."""
     result: Dict[str, Optional[Dict[str, Any]]] = {aid: None for aid in arxiv_ids}
     if not arxiv_ids:
         return result
 
     url = f"{SEMANTIC_SCHOLAR_BASE_URL}/batch?fields={S2_BATCH_FIELDS}"
     headers = _auth_headers()
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         for chunk in _chunked(arxiv_ids, S2_BATCH_MAX_IDS):
             body = {"ids": [f"ARXIV:{aid}" for aid in chunk]}
             response = await _s2_post(client, url, body, headers=headers)
             response.raise_for_status()
-            payload = response.json() or []
+            payload = response.json()
+            if not isinstance(payload, list):
+                # Defensive: a non-list payload (e.g. an error dict) must NOT be
+                # zipped over — that would iterate dict KEYS and silently map
+                # papers by key order. Treat it as "no records this chunk".
+                logger.warning(
+                    "S2 batch returned a non-list payload; treating as empty"
+                )
+                payload = []
             for arxiv_id, entry in zip(chunk, payload):
                 # entry is None when S2 has no record for that id.
                 result[arxiv_id] = entry if isinstance(entry, dict) else None
@@ -456,7 +502,11 @@ async def handle_library_influence(
 ) -> List[types.TextContent]:
     """Wire PaperManager + S2 batch fetch + markdown scan into the pure core."""
     try:
-        if nx is None:
+        # networkx.pagerank dispatches to its scipy solver (no pure-python
+        # fallback in networkx>=3), so BOTH must be present. Gating on both
+        # yields the helpful `[influence]` install hint instead of a raw
+        # "No module named 'scipy'" surfacing through the broad except below.
+        if nx is None or _scipy is None:
             return _dependency_error_envelope()
 
         # Defense-in-depth coercion (schema enforces minimum 1 / array / bool).
@@ -469,8 +519,11 @@ async def handle_library_influence(
         stems = await manager.list_papers()
 
         # The paper_ids filter matches on canonical (unversioned) ids, so a user
-        # passing `2401.12345` matches a local stem `2401.12345v2`.
-        if requested_ids:
+        # passing `2401.12345` matches a local stem `2401.12345v2`. Use
+        # `is not None` (not truthiness): an explicit `paper_ids: []` restricts
+        # to nothing (an empty panel), whereas an omitted paper_ids means
+        # "whole library".
+        if requested_ids is not None:
             requested = {_normalize_arxiv_id(str(pid)) for pid in requested_ids}
             stems = [s for s in stems if _normalize_arxiv_id(s) in requested]
 

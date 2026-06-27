@@ -113,9 +113,13 @@ def test_build_rows_ranking_and_delta():
 
     # Disagreement delta = global_rank - pagerank_rank (rank 1 = best).
     # pagerank ranks: C=1, B=2, A=3 ; global ranks: A=1, B=2, C=3.
+    # C (local_citations 2) and B (1) have in-library citations -> real deltas.
     assert rows["C"]["local_vs_global_delta"] == 2  # 3 - 1 : hidden gem (positive)
     assert rows["B"]["local_vs_global_delta"] == 0  # 2 - 2
-    assert rows["A"]["local_vs_global_delta"] == -2  # 1 - 3 : globally famous
+    # A has 0 in-library citations (PageRank dangling floor) -> null delta (FIX 1),
+    # not the alphabetical-noise value its ordinal ranks would otherwise produce.
+    assert rows["A"]["local_citations"] == 0
+    assert rows["A"]["local_vs_global_delta"] is None
 
     # Pass-through signal columns.
     assert rows["A"]["global_citations"] == 1000
@@ -171,6 +175,10 @@ def test_build_rows_edgeless_uniform_pagerank():
         # Uniform 1/N = 0.25, rounded to 6 dp.
         assert row["pagerank"] == 0.25
         assert row["local_citations"] == 0
+        # Every paper is at the dangling floor -> null delta (FIX 1).
+        assert row["local_vs_global_delta"] is None
+    # ...and a note explains why.
+    assert any("local_citations == 0" in note for note in result["notes"])
 
 
 def test_build_rows_paper_missing_from_s2():
@@ -205,8 +213,10 @@ def test_build_rows_paper_missing_from_s2():
 def test_build_rows_null_citation_null_delta():
     """A paper PRESENT on S2 but with a null citationCount gets a null delta.
 
-    It still participates in the PageRank ranking and still appears as a row;
-    only its global-comparison delta is undefined."""
+    Mutual citation (A<->B) gives BOTH papers an in-library citation, so this
+    isolates the null-COUNT rule from the zero-in-degree rule (FIX 1): B's delta
+    is null purely because its global citationCount is null, not because it is
+    uncited locally. A (which has a count and is cited) gets a real int delta."""
     library_ids = ["A", "B"]
     s2_data = {
         "A": {
@@ -214,19 +224,67 @@ def test_build_rows_null_citation_null_delta():
             "citationCount": 100,
             "references": [{"externalIds": {"ArXiv": "B"}}],
         },
-        # Present record, but no global citation count.
-        "B": {"title": "Paper B", "citationCount": None, "references": []},
+        # Present record, cited locally (A->B... and B->A below), but no count.
+        "B": {
+            "title": "Paper B",
+            "citationCount": None,
+            "references": [{"externalIds": {"ArXiv": "A"}}],
+        },
     }
     has_code_map = {"A": False, "B": False}
     result = build_influence_rows(library_ids, s2_data, has_code_map, top_k=20)
 
     rows = {row["arxiv_id"]: row for row in result["papers"]}
+    # Both papers are cited within the library (mutual citation).
+    assert rows["A"]["local_citations"] == 1
+    assert rows["B"]["local_citations"] == 1
+    # B: present record, null count -> null delta (the null-COUNT rule alone).
     assert rows["B"]["global_citations"] is None
     assert rows["B"]["local_vs_global_delta"] is None
-    # B still ranks (received the induced edge A->B).
-    assert rows["B"]["local_citations"] == 1
-    # A has a count -> a real integer delta.
+    # A: has a count AND an in-library citation -> a real integer delta.
     assert isinstance(rows["A"]["local_vs_global_delta"], int)
+
+
+def test_build_rows_versioned_reference_builds_edge():
+    """A VERSIONED S2 reference id still matches a canonical library node (FIX 2).
+
+    S2 may return `references.externalIds.ArXiv` with a version suffix; without
+    normalizing the reference side of the join the induced edge is silently
+    dropped (defeating the module's version-robustness on one side)."""
+    library_ids = ["2401.0001", "2401.0002"]  # canonical (unversioned) nodes
+    s2_data = {
+        "2401.0001": {
+            "title": "One",
+            "citationCount": 5,
+            # The reference id is VERSIONED but must match node "2401.0002".
+            "references": [{"externalIds": {"ArXiv": "2401.0002v1"}}],
+        },
+        "2401.0002": {"title": "Two", "citationCount": 2, "references": []},
+    }
+    has_code_map = {"2401.0001": False, "2401.0002": False}
+    result = build_influence_rows(library_ids, s2_data, has_code_map, top_k=20)
+
+    assert result["graph"]["edges"] == 1
+    rows = {row["arxiv_id"]: row for row in result["papers"]}
+    assert rows["2401.0002"]["local_citations"] == 1
+    # 0002 has an in-library citation and a global count -> a real int delta.
+    assert isinstance(rows["2401.0002"]["local_vs_global_delta"], int)
+
+
+def test_build_rows_versioned_self_reference_no_loop():
+    """A versioned self-reference must not create a self-loop (canonical guard, FIX 2)."""
+    library_ids = ["2401.0001"]
+    s2_data = {
+        "2401.0001": {
+            "title": "One",
+            "citationCount": 1,
+            # A versioned reference to ITSELF -> canonical self-loop, suppressed.
+            "references": [{"externalIds": {"ArXiv": "2401.0001v2"}}],
+        }
+    }
+    result = build_influence_rows(library_ids, s2_data, {"2401.0001": False}, top_k=20)
+    assert result["graph"]["edges"] == 0
+    assert result["graph"]["nodes"] == 1
 
 
 def test_build_rows_top_k_truncation():
@@ -432,6 +490,39 @@ async def test_handle_library_influence_networkx_absent(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_library_influence_scipy_absent(monkeypatch):
+    """networkx-present/scipy-absent yields the SAME helpful hint (FIX 4), not a
+    raw 'No module named scipy' (which is what nx.pagerank would raise)."""
+    monkeypatch.setattr(influence, "_scipy", None)
+    response = await handle_library_influence({})
+    payload = json.loads(response[0].text)
+    assert payload["status"] == "error"
+    assert "influence" in payload["message"]
+    assert "pip install" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_empty_paper_ids_empty_panel(monkeypatch):
+    """An explicit `paper_ids: []` restricts to nothing -> empty success panel (FIX 8)."""
+    library_ids, s2_data, _ = _three_paper_fixture()
+    monkeypatch.setattr(
+        influence, "_get_paper_manager", lambda: StubManager(library_ids)
+    )
+
+    async def fake_fetch(ids):
+        return {aid: s2_data.get(aid) for aid in ids}
+
+    monkeypatch.setattr(influence, "_fetch_s2_batch", fake_fetch)
+
+    response = await handle_library_influence({"paper_ids": []})
+    payload = json.loads(response[0].text)
+    assert payload["status"] == "success"
+    assert payload["library_size"] == 0
+    assert payload["papers"] == []
+    assert payload["graph"] == {"nodes": 0, "edges": 0}
+
+
+@pytest.mark.asyncio
 async def test_handle_library_influence_error_envelope(monkeypatch):
     """An unexpected failure surfaces the JSON error envelope, not a raw raise."""
 
@@ -592,3 +683,84 @@ async def test_fetch_s2_batch_empty_no_request():
 
     assert result == {}
     mock_client_class.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_s2_batch_short_payload_trailing_none():
+    """A batch response with FEWER entries than ids leaves trailing ids None."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.raise_for_status = MagicMock()
+    # Two ids requested, only ONE entry returned.
+    mock_response.json.return_value = [{"title": "Paper A", "citationCount": 1}]
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        result = await influence._fetch_s2_batch(["A", "B"])
+
+    assert result["A"] == {"title": "Paper A", "citationCount": 1}
+    # The unmatched trailing id stays None rather than crashing.
+    assert result["B"] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_s2_batch_non_list_payload_warns(caplog):
+    """A non-list payload (e.g. an error dict) is treated as empty, with a warning
+    (FIX 9) — never zipped over a dict's keys."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {}
+    mock_response.raise_for_status = MagicMock()
+    # A dict, not the expected list.
+    mock_response.json.return_value = {"error": "bad request"}
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client_class.return_value = mock_client
+
+        with caplog.at_level("WARNING"):
+            result = await influence._fetch_s2_batch(["A", "B"])
+
+    assert result == {"A": None, "B": None}
+    assert "non-list" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_s2_post_retries_on_429(monkeypatch):
+    """_s2_post retries a transient 429 and returns the subsequent 200."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    # Mock out the backoff sleep so the retry is instant.
+    monkeypatch.setattr(influence.asyncio, "sleep", AsyncMock())
+
+    rate_limited = MagicMock()
+    rate_limited.status_code = 429
+    rate_limited.headers = {}
+
+    ok_response = MagicMock()
+    ok_response.status_code = 200
+    ok_response.headers = {}
+
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=[rate_limited, ok_response])
+
+    response = await influence._s2_post(
+        client, "https://s2/batch", {"ids": ["ARXIV:A"]}
+    )
+
+    assert response is ok_response
+    # First POST hit 429, second POST returned 200.
+    assert client.post.await_count == 2
