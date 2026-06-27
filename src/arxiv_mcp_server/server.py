@@ -34,6 +34,8 @@ from .tools import (
     reindex_tool,
     handle_citation_graph,
     citation_graph_tool,
+    handle_library_influence,
+    library_influence_tool,
     handle_watch_topic,
     watch_topic_tool,
     handle_check_alerts,
@@ -74,6 +76,7 @@ async def list_tools() -> List[types.Tool]:
         semantic_search_tool,
         reindex_tool,
         citation_graph_tool,
+        library_influence_tool,
         watch_topic_tool,
         check_alerts_tool,
     ]
@@ -116,6 +119,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             result = await handle_reindex(arguments)
         elif name == "citation_graph":
             result = await handle_citation_graph(arguments)
+        elif name == "library_influence":
+            result = await handle_library_influence(arguments)
         elif name == "watch_topic":
             result = await handle_watch_topic(arguments)
         elif name == "check_alerts":
