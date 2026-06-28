@@ -8,6 +8,23 @@ All notable changes to this project are documented here. The format is based on
 [`arxiv-mcp-server`](https://github.com/blazickjp/arxiv-mcp-server) by Joseph Blazick
 (Pearl Labs). Releases up to and including v0.5.0 were published under the original name.
 
+## [Unreleased]
+
+### Added
+- **`library_influence`** — a descriptive influence panel over your *downloaded*
+  library (C5). Builds the induced citation subgraph across local papers (no
+  database), then ranks them by personalised PageRank alongside global/local
+  citation counts, author pedigree (max co-author h-index), and a has-code
+  signal. The load-bearing column is `local_vs_global_delta` — where a paper's
+  standing *inside* your corpus disagrees with its global citation footprint
+  (a corpus "hidden gem"). Reuses `citation_graph`'s Semantic Scholar pacing /
+  backoff / optional API key, fetching references and counts via the
+  `/paper/batch` endpoint (chunked at 100 ids). Descriptive only — the
+  predictive layer stays gated on a pre-registered backtest. Requires the
+  opt-in `[influence]` extra (`pip install "arxiv-mcp-pro[influence]"`,
+  pulls `networkx`+`scipy`); the base install is unaffected, and the tool
+  degrades gracefully with an install hint when the extra is absent.
+
 ## [0.6.0] - 2026-06-26
 
 First release under the **`arxiv-mcp-pro`** name — the project detached from the upstream
