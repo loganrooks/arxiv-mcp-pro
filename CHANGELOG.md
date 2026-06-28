@@ -108,5 +108,7 @@ _Published as `arxiv-mcp-server`._
 Published as `arxiv-mcp-server` by Joseph Blazick. See the
 [commit history](https://github.com/loganrooks/arxiv-mcp-pro/commits/main) for details.
 
+[Unreleased]: https://github.com/loganrooks/arxiv-mcp-pro/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.7.0
 [0.6.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.6.0
 [0.5.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.5.0
