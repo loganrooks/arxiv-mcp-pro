@@ -10,6 +10,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-27
+
+First release published to PyPI under the **`arxiv-mcp-pro`** name (via PyPI
+Trusted Publishing / OIDC). `pip install arxiv-mcp-pro`.
+
 ### Added
 - **`library_influence`** — a descriptive influence panel over your *downloaded*
   library (C5). Builds the induced citation subgraph across local papers (no
@@ -24,6 +29,18 @@ All notable changes to this project are documented here. The format is based on
   opt-in `[influence]` extra (`pip install "arxiv-mcp-pro[influence]"`,
   pulls `networkx`+`scipy`); the base install is unaffected, and the tool
   degrades gracefully with an install hint when the extra is absent.
+
+### Changed
+- **Release pipeline wired** — `publish.yml` now uses PyPI Trusted Publishing
+  (OIDC) instead of a stored API token; `lint.yml` is check-only (`black
+  --check`) and no longer auto-commits formatting back to a protected branch.
+- Trimmed the published **sdist** to source + essential metadata (was sweeping in
+  repo/agent internals like `CLAUDE.md`, `.claude/`, `.github/`); the wheel was
+  already scoped to the package.
+
+### Removed
+- Dropped `black` from the **runtime** dependencies (it is a dev tool, used only
+  via pre-commit / the `dev` extra — it was never imported at runtime).
 
 ## [0.6.0] - 2026-06-26
 
@@ -91,5 +108,7 @@ _Published as `arxiv-mcp-server`._
 Published as `arxiv-mcp-server` by Joseph Blazick. See the
 [commit history](https://github.com/loganrooks/arxiv-mcp-pro/commits/main) for details.
 
+[Unreleased]: https://github.com/loganrooks/arxiv-mcp-pro/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.7.0
 [0.6.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.6.0
 [0.5.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.5.0

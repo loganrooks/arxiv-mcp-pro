@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arxiv-mcp-pro"
-version = "0.6.0"
+version = "0.7.0"
 description = "A flexible arXiv search and analysis service with MCP protocol support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -43,7 +43,6 @@ dependencies = [
     "starlette>=0.27.0",
     "sse-starlette>=1.8.2",
     "anyio>=4.2.0",
-    "black>=25.1.0",
 ]
 
 [project.urls]
@@ -62,6 +61,11 @@ test = [
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.10.0",
     "aioresponses>=0.7.6",
+    # black is needed here because the `gates` CI job runs the pre-commit hooks
+    # with `language: system`, taking black from `pip install -e ".[test]"`.
+    # (It used to arrive via the runtime deps; that was wrong — it is dev-time
+    # tooling — so it now lives in the test/dev extras, not the base install.)
+    "black>=25.1.0",
     # numpy is needed for the semantic_search test suite to actually RUN in CI
     # (the tests `importorskip("numpy")`; it otherwise lives only in the heavy
     # `pro` extra, so CI silently skipped them). sentence-transformers is NOT
@@ -104,6 +108,23 @@ arxiv-mcp-server = "arxiv_mcp_server:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/arxiv_mcp_server"]
 
+# Keep the published sdist to source + essential metadata. The default hatchling
+# sdist sweeps in everything the *repo-local* .gitignore doesn't exclude — which
+# includes repo/agent internals (CLAUDE.md, .claude/, AGENTS.md, docs/governance/,
+# .github/) AND the private `goal/` planning repo (ignored only via a *global*
+# gitignore hatchling does not honor). Patterns are leading-slash-anchored to root
+# so they don't recurse (an unanchored `README.md` matches `goal/README.md` too).
+# The wheel is already scoped to the package above.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/arxiv_mcp_server",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/pyproject.toml",
+]
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
@@ -123,5 +144,6 @@ exclude = '''
   | build
   | dist
   | mcpb-build
+  | goal
 )/
 '''

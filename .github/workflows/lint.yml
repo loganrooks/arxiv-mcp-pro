@@ -1,5 +1,11 @@
 name: Lint
 
+# Check-only. Black is enforced locally by pre-commit and by the `gates` job in
+# ci.yml, so code reaching CI is already formatted; this fails fast (with a diff)
+# if it is not. It deliberately does NOT auto-format and push back to the branch:
+# a CI push to a protected `main` (enforce_admins + required checks) is a
+# foot-gun, and the auto-fix was redundant with the local + gates enforcement.
+
 on:
   push:
     branches: [ main, master ]
@@ -8,16 +14,13 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-      with:
-        ref: ${{ github.head_ref || github.ref_name }}
-        token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -27,12 +30,5 @@ jobs:
     - name: Install Black
       run: pip install black
 
-    - name: Run Black (auto-format)
-      run: black .
-
-    - name: Commit and push formatting fixes (push events only)
-      if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
-      run: |
-        git config --local user.name "github-actions[bot]"
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        git diff --quiet || (git add -A && git commit -m "style: auto-format with Black" && git push)
+    - name: Check formatting (fail with diff if unformatted)
+      run: black --check --diff .

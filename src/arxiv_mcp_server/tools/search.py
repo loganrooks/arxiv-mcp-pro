@@ -22,8 +22,13 @@ _last_request_time: float = 0.0
 _request_lock = asyncio.Lock()
 _MIN_REQUEST_INTERVAL = 3.0  # seconds
 
+# Single-source the version from package metadata (settings.APP_VERSION) so the
+# User-Agent can't drift from the released version the way a hardcoded string did.
 ARXIV_HEADERS = {
-    "User-Agent": "arxiv-mcp-pro/0.6.0 (https://github.com/loganrooks/arxiv-mcp-pro; research tool)"
+    "User-Agent": (
+        f"arxiv-mcp-pro/{settings.APP_VERSION} "
+        "(https://github.com/loganrooks/arxiv-mcp-pro; research tool)"
+    )
 }
 
 
