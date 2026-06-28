@@ -3,7 +3,6 @@
 from pathlib import Path
 from typing import List
 import arxiv
-import pymupdf4llm
 import aiofiles
 import logging
 from pydantic import AnyUrl
@@ -36,6 +35,13 @@ class PaperManager:
             return True
 
         try:
+            # Lazy import: pymupdf4llm (the `[pdf]` extra) is only needed for
+            # PDF->markdown conversion here. Importing it at module top coupled
+            # every PaperManager user — including the read/list paths that
+            # library_influence relies on — to the `[pdf]` extra. Defer it so
+            # listing/reading the local library works on a base/[influence] install.
+            import pymupdf4llm
+
             paper = next(self.client.results(arxiv.Search(id_list=[paper_id])))
             paper.download_pdf(dirpath=self.storage_path, filename=paper_pdf_path)
             markdown = pymupdf4llm.to_markdown(paper_pdf_path, show_progress=False)

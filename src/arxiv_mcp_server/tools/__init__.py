@@ -12,6 +12,7 @@ from .semantic_search import (
     handle_reindex,
 )
 from .citation_graph import citation_graph_tool, handle_citation_graph
+from .influence import library_influence_tool, handle_library_influence
 from .alerts import (
     watch_topic_tool,
     handle_watch_topic,
@@ -36,6 +37,8 @@ __all__ = [
     "handle_reindex",
     "citation_graph_tool",
     "handle_citation_graph",
+    "library_influence_tool",
+    "handle_library_influence",
     "watch_topic_tool",
     "handle_watch_topic",
     "check_alerts_tool",

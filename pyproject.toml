@@ -66,7 +66,15 @@ test = [
     # (the tests `importorskip("numpy")`; it otherwise lives only in the heavy
     # `pro` extra, so CI silently skipped them). sentence-transformers is NOT
     # needed — those tests monkeypatch the model.
-    "numpy>=1.26.0"
+    "numpy>=1.26.0",
+    # networkx is needed for the library_influence (C5) test suite to actually
+    # RUN in CI. It otherwise lives only in the `influence` extra; mirroring the
+    # numpy lesson above, a test-only dep that lives solely in a feature extra
+    # makes CI silently skip the whole suite. scipy is required because
+    # networkx>=3's public `pagerank` dispatches to its scipy solver with no
+    # pure-python fallback (it raises ModuleNotFoundError otherwise).
+    "networkx>=3.0",
+    "scipy>=1.10",
 ]
 dev = [
     "black>=23.3.0"
@@ -74,6 +82,12 @@ dev = [
 pro = [
     "sentence-transformers>=3.0.0",
     "numpy>=1.26.0",
+]
+influence = [
+    "networkx>=3.0",
+    # networkx's public pagerank() uses the scipy solver (no pure-python
+    # fallback in networkx>=3), so scipy is a hard runtime requirement here.
+    "scipy>=1.10",
 ]
 
 [tool.pytest.ini_options]
