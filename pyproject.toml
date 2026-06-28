@@ -61,6 +61,11 @@ test = [
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.10.0",
     "aioresponses>=0.7.6",
+    # black is needed here because the `gates` CI job runs the pre-commit hooks
+    # with `language: system`, taking black from `pip install -e ".[test]"`.
+    # (It used to arrive via the runtime deps; that was wrong — it is dev-time
+    # tooling — so it now lives in the test/dev extras, not the base install.)
+    "black>=25.1.0",
     # numpy is needed for the semantic_search test suite to actually RUN in CI
     # (the tests `importorskip("numpy")`; it otherwise lives only in the heavy
     # `pro` extra, so CI silently skipped them). sentence-transformers is NOT

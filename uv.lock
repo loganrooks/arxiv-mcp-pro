@@ -234,6 +234,7 @@ pro = [
 ]
 test = [
     { name = "aioresponses" },
+    { name = "black" },
     { name = "networkx" },
     { name = "numpy" },
     { name = "pytest" },
@@ -251,6 +252,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.2.0" },
     { name = "arxiv", specifier = ">=2.1.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.3.0" },
+    { name = "black", marker = "extra == 'test'", specifier = ">=25.1.0" },
     { name = "httpx", specifier = ">=0.24.0" },
     { name = "mcp", specifier = ">=1.27.0" },
     { name = "networkx", marker = "extra == 'influence'", specifier = ">=3.0" },
