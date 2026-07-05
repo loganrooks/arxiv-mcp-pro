@@ -10,6 +10,31 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+Repo polish after the v0.7.0 PyPI release. Documentation, CI, and contributor
+tooling only — **no runtime code changes.**
+
+### Added
+- Contributor scaffolding: `CONTRIBUTING.md`, GitHub issue templates (bug / feature),
+  a pull request template, and a Dependabot config (weekly `pip` + `github-actions`
+  updates). Also a committed `.claude/settings.json` with a minimal permissions allowlist.
+
+### Changed
+- CI tuning: added `concurrency` (auto-cancel superseded runs) to the `CI`, `Lint`,
+  and `Run Tests` workflows, and pip dependency caching to `CI` and `Lint` (the `Run
+  Tests` matrix installs via `uv`, so pip caching does not apply — a uv cache is a
+  follow-up); removed the dead `master` branch triggers and leftover template comments.
+
+### Fixed
+- README no longer claims a PyPI package is "planned for a future release" — the package
+  shipped to PyPI on 2026-07-05. Install docs now lead with `pip install arxiv-mcp-pro` /
+  `uvx arxiv-mcp-pro`, a PyPI version badge is added, the macOS `.mcpb` desktop bundle on
+  GitHub Releases is referenced, and the stale "until the PyPI package ships" MCP-config
+  note is gone.
+- Agent docs corrected: `CLAUDE.md` mis-expanded MCP as "Message Control Protocol"
+  (→ *Model Context Protocol*), listed only 4 of the ~10 tool modules, and documented
+  non-existent `ARXIV_*`-prefixed env vars; `AGENTS.md` (previously stale instructions for a
+  removed tool) is now a lean, tracked agent guide.
+
 ## [0.7.0] - 2026-06-27
 
 First release published to PyPI under the **`arxiv-mcp-pro`** name (via PyPI

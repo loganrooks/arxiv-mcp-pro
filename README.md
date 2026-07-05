@@ -1,3 +1,4 @@
+[![PyPI](https://img.shields.io/pypi/v/arxiv-mcp-pro)](https://pypi.org/project/arxiv-mcp-pro/)
 [![Tests](https://github.com/loganrooks/arxiv-mcp-pro/actions/workflows/tests.yml/badge.svg)](https://github.com/loganrooks/arxiv-mcp-pro/actions/workflows/tests.yml)
 [![GitHub Stars](https://img.shields.io/github/stars/loganrooks/arxiv-mcp-pro?style=flat)](https://github.com/loganrooks/arxiv-mcp-pro/stargazers)
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -66,25 +67,20 @@ Agentic AI framework as **AG01: Prompt Injection in LLM-Integrated Systems**.
 
 ## 🚀 Quick Start
 
-### Install from source
+### Install
 
-> **Install status.** `arxiv-mcp-pro` runs from source today. A published PyPI package
-> (`uvx arxiv-mcp-pro`) and a one-click Claude Desktop `.mcpb` bundle are planned for a
-> future release — until then, use the from-source setup below.
+`arxiv-mcp-pro` is published on [PyPI](https://pypi.org/project/arxiv-mcp-pro/). Install it,
+or run it with no install at all via `uvx`:
 
 ```bash
-# Clone the repository
-git clone https://github.com/loganrooks/arxiv-mcp-pro.git
-cd arxiv-mcp-pro
+# Install from PyPI
+pip install arxiv-mcp-pro
 
-# Create and activate a virtual environment
-uv venv
-source .venv/bin/activate
+# ...or run it directly, no install, with uv:
+uvx arxiv-mcp-pro --help
 
-# Install (add the [pdf] extra for older, PDF-only papers)
-uv pip install -e .
-# or, with PDF support:
-uv pip install -e ".[pdf]"
+# Add the [pdf] extra for older, PDF-only papers:
+pip install "arxiv-mcp-pro[pdf]"
 ```
 
 Verify the install:
@@ -95,11 +91,25 @@ arxiv-mcp-pro --help
 
 > **PDF fallback (older papers):** Most arXiv papers have an HTML version handled
 > automatically. Older papers that only have a PDF need the `[pdf]` extra
-> (pymupdf4llm) — install it with `uv pip install -e ".[pdf]"` as shown above.
+> (pymupdf4llm) — install it with `pip install "arxiv-mcp-pro[pdf]"`.
 
-For development, install the test extra:
+**macOS desktop bundle:** a one-click Claude Desktop `.mcpb` bundle (macOS, Apple Silicon)
+is attached to each [GitHub Release](https://github.com/loganrooks/arxiv-mcp-pro/releases).
+
+### Development install
+
+To hack on the server from a local clone:
 
 ```bash
+# Clone the repository
+git clone https://github.com/loganrooks/arxiv-mcp-pro.git
+cd arxiv-mcp-pro
+
+# Create and activate a virtual environment
+uv venv
+source .venv/bin/activate
+
+# Install with the test extra (dev + test dependencies)
 uv pip install -e ".[test]"
 ```
 
@@ -129,8 +139,38 @@ If your Codex client supports plugin manifests, point it at
 
 ### 🔌 MCP Integration
 
-Until the PyPI package ships, point your MCP client at your local clone with
-`uv --directory`:
+Point your MCP client at the published package with `uvx` — no separate install
+step required:
+
+```json
+{
+    "mcpServers": {
+        "arxiv": {
+            "command": "uvx",
+            "args": [
+                "arxiv-mcp-pro",
+                "--storage-path", "/path/to/paper/storage"
+            ]
+        }
+    }
+}
+```
+
+If you have already installed the package (`pip install arxiv-mcp-pro`), invoke the
+console script directly instead:
+
+```json
+{
+    "mcpServers": {
+        "arxiv": {
+            "command": "arxiv-mcp-pro",
+            "args": ["--storage-path", "/path/to/paper/storage"]
+        }
+    }
+}
+```
+
+For development against a local clone, run it in place with `uv --directory`:
 
 ```json
 {
@@ -140,24 +180,6 @@ Until the PyPI package ships, point your MCP client at your local clone with
             "args": [
                 "--directory",
                 "/path/to/cloned/arxiv-mcp-pro",
-                "run",
-                "arxiv-mcp-pro",
-                "--storage-path", "/path/to/paper/storage"
-            ]
-        }
-    }
-}
-```
-
-Once `arxiv-mcp-pro` is published to PyPI, the simpler `uv tool run` form will also work:
-
-```json
-{
-    "mcpServers": {
-        "arxiv": {
-            "command": "uv",
-            "args": [
-                "tool",
                 "run",
                 "arxiv-mcp-pro",
                 "--storage-path", "/path/to/paper/storage"

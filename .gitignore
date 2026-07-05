@@ -43,3 +43,6 @@ ENV/
 .mcpregistry_github_token
 .mcpregistry_registry_token
 mcp-publisher
+
+# private mission-control repo (separate nested git repo, not part of the public package)
+goal/

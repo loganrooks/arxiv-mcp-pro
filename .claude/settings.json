@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "Bash(pre-commit run:*)",
+      "Bash(black --check:*)",
+      "Bash(uv pip install:*)"
+    ]
+  }
+}
