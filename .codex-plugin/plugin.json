@@ -1,6 +1,6 @@
 {
   "name": "arxiv-mcp-pro",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Search arXiv papers, download full text, semantic search, citation graphs, and alerts via MCP.",
   "author": {
     "name": "Logan Rooks",

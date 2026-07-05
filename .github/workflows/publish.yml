@@ -1,34 +1,43 @@
 name: Publish to PyPI
 
+# Publishes on a GitHub Release via PyPI Trusted Publishing (OIDC) — no API
+# token / secret is stored in this repo. PyPI must have a Trusted Publisher
+# configured for project `arxiv-mcp-pro`:
+#   owner=loganrooks, repo=arxiv-mcp-pro, workflow=publish.yml, environment=pypi
+# (https://pypi.org/manage/account/publishing/). The first successful run also
+# registers (claims) the project name on PyPI.
+
 on:
   release:
     types: [published]
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/arxiv-mcp-pro
+    permissions:
+      # Job-level permissions REPLACE the workflow-level block (any scope left
+      # unspecified defaults to `none`), so contents:read must be restated here
+      # for actions/checkout to fetch the repo under the default GITHUB_TOKEN.
+      contents: read
+      id-token: write  # OIDC token for Trusted Publishing
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-    
-    - name: Install build dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install build hatchling
-    
-    - name: Build package
-      run: python -m build
-    
-    - name: Publish to PyPI
-      uses: pypa/gh-action-pypi-publish@v1.8.11
-      with:
-        user: __token__
-        password: ${{ secrets.PYPI_API_TOKEN }}
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
