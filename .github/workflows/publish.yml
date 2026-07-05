@@ -21,7 +21,11 @@ jobs:
       name: pypi
       url: https://pypi.org/p/arxiv-mcp-pro
     permissions:
-      id-token: write  # OIDC token for Trusted Publishing — the only auth needed
+      # Job-level permissions REPLACE the workflow-level block (any scope left
+      # unspecified defaults to `none`), so contents:read must be restated here
+      # for actions/checkout to fetch the repo under the default GITHUB_TOKEN.
+      contents: read
+      id-token: write  # OIDC token for Trusted Publishing
     steps:
       - uses: actions/checkout@v4
 
