@@ -18,6 +18,7 @@ import os
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from arxiv_mcp_server.tools import arxiv_pacing
@@ -245,6 +246,60 @@ async def test_record_cooldown_no_file_when_disabled(paced, monkeypatch):
     assert not (paced / "arxiv_api.cooldown").exists()
 
 
+@pytest.mark.asyncio
+async def test_cooldown_published_while_queued_is_honored(paced, monkeypatch):
+    """FIX-B: a cooldown published while a caller is queued behind the interval
+    lock is caught by the in-lock re-check (the pre-lock snapshot would miss it).
+
+    Deterministic: _cooldown_remaining is scripted so the pre-lock check sees
+    nothing, the first in-lock re-check sees a fresh 0.4s cooldown, then clears.
+    """
+    _set_interval(monkeypatch, 0.3)
+    _quiesce_interval_gate(paced)  # old lock mtime → the interval gate adds no wait
+    monkeypatch.setattr(arxiv_pacing, "_last_request_time", 0.0)
+
+    seq = iter([0.0, 0.4, 0.0])
+
+    async def _scripted_remaining():
+        return next(seq, 0.0)
+
+    monkeypatch.setattr(arxiv_pacing, "_cooldown_remaining", _scripted_remaining)
+
+    slept = []
+
+    async def _fake_sleep(secs):
+        slept.append(secs)
+
+    monkeypatch.setattr(arxiv_pacing.asyncio, "sleep", _fake_sleep)
+
+    await arxiv_pacing.pace_arxiv_request()
+
+    # 0.4 came from the in-lock re-check, not the (0.0) pre-lock snapshot.
+    assert 0.4 in slept
+
+
+@pytest.mark.asyncio
+async def test_cooldown_never_shortens_deadline(paced, monkeypatch):
+    """FIX-C: a later, smaller cooldown must not shrink an earlier larger one,
+    in either channel (file + in-process)."""
+    _set_interval(monkeypatch, 3.0)
+
+    arxiv_pacing.record_arxiv_cooldown(120.0)
+    long_file = float((paced / "arxiv_api.cooldown").read_text())
+    long_inproc = arxiv_pacing._not_before
+
+    arxiv_pacing.record_arxiv_cooldown(60.0)  # smaller, later — must not win
+    assert float((paced / "arxiv_api.cooldown").read_text()) == pytest.approx(long_file)
+    assert arxiv_pacing._not_before == pytest.approx(long_inproc)
+
+
+def test_lock_acquire_timeout_scales_with_interval():
+    """FIX-D: the effective lock-acquisition deadline is max(60, 2*interval)."""
+    assert arxiv_pacing._lock_acquire_timeout(3.0) == 60.0  # floor dominates
+    assert arxiv_pacing._lock_acquire_timeout(30.0) == 60.0  # 2*30 == floor
+    assert arxiv_pacing._lock_acquire_timeout(90.0) == 180.0  # 2*interval wins
+
+
 # ---------------------------------------------------------------------------
 # Cross-process gate recheck loop (C-2)
 #
@@ -346,24 +401,73 @@ async def test_retry_after_short_retries_once_and_succeeds(monkeypatch):
     assert 1.0 in slept
 
 
-@pytest.mark.asyncio
-async def test_retry_after_zero_is_floored_to_interval(monkeypatch):
-    """Retry-After: 0 (also negative / past HTTP-date → 0.0) is floored to the
-    configured interval so the retry request is still paced instead of firing
-    immediately at a distressed server (MAJOR-3)."""
-    monkeypatch.setattr(arxiv_pacing.settings, "ARXIV_MIN_REQUEST_INTERVAL", 0.3)
-    # Neutralise the top-level pacer/recorders so this test isolates the floor and
-    # never touches the real storage dir (interval>0 would otherwise write files).
-    monkeypatch.setattr("arxiv_mcp_server.tools.search.pace_arxiv_request", AsyncMock())
+def _count_pace_calls(monkeypatch):
+    """Replace search's pacer with a counter and neutralise the recorders so a
+    _rate_limited_get test never touches the real storage dir."""
+    pace_calls = []
+
+    async def _counting_pace():
+        pace_calls.append(1)
+
+    monkeypatch.setattr(
+        "arxiv_mcp_server.tools.search.pace_arxiv_request", _counting_pace
+    )
     monkeypatch.setattr(
         "arxiv_mcp_server.tools.search.record_arxiv_request", MagicMock()
     )
     monkeypatch.setattr(
         "arxiv_mcp_server.tools.search.record_arxiv_cooldown", MagicMock()
     )
+    return pace_calls
+
+
+@pytest.mark.asyncio
+async def test_timeout_retry_re_paces(monkeypatch):
+    """FIX-A: the timeout retry re-enters the pacer — pace is called once per
+    loop attempt — so a raised interval isn't undercut by the fixed 5s backoff."""
+    pace_calls = _count_pace_calls(monkeypatch)
+
+    async def _fake_sleep(secs):
+        pass
+
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.asyncio.sleep", _fake_sleep)
 
     client = MagicMock()
-    client.get = AsyncMock(side_effect=[_resp(429, {"Retry-After": "0"}), _resp(200)])
+    client.get = AsyncMock(side_effect=[httpx.TimeoutException("boom"), _resp(200)])
+
+    response = await _rate_limited_get(client, "https://example.test/q")
+
+    assert response.status_code == 200
+    assert len(pace_calls) == 2  # initial attempt + timeout retry
+
+
+@pytest.mark.asyncio
+async def test_429_retry_re_paces(monkeypatch):
+    """FIX-A: the 429-retry GET is re-paced (not fired straight after the
+    Retry-After sleep), so callers that slept the same header don't stampede."""
+    pace_calls = _count_pace_calls(monkeypatch)
+
+    async def _fake_sleep(secs):
+        pass
+
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.asyncio.sleep", _fake_sleep)
+
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=[_resp(429, {"Retry-After": "1"}), _resp(200)])
+
+    response = await _rate_limited_get(client, "https://example.test/q")
+
+    assert response.status_code == 200
+    assert len(pace_calls) == 2  # loop-top pace + re-pace before the retry GET
+
+
+@pytest.mark.asyncio
+async def test_retry_after_zero_still_paces_retry(monkeypatch):
+    """Retry-After 0 (also negative / past HTTP-date → 0.0) no longer sleeps a
+    floored interval — the floor is gone — but the retry is still paced by the
+    re-pace before the retry GET, so it cannot fire an immediate unpaced request
+    (replaces the MAJOR-3 sleep-floor)."""
+    pace_calls = _count_pace_calls(monkeypatch)
     slept = []
 
     async def _fake_sleep(secs):
@@ -371,11 +475,15 @@ async def test_retry_after_zero_is_floored_to_interval(monkeypatch):
 
     monkeypatch.setattr("arxiv_mcp_server.tools.search.asyncio.sleep", _fake_sleep)
 
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=[_resp(429, {"Retry-After": "0"}), _resp(200)])
+
     response = await _rate_limited_get(client, "https://example.test/q")
 
     assert response.status_code == 200
     assert client.get.await_count == 2
-    assert slept and slept[0] == pytest.approx(0.3), f"not floored: {slept}"
+    assert len(pace_calls) == 2  # retry is paced, not fired immediately
+    assert slept == [0.0]  # sleep is the raw Retry-After (no interval floor)
 
 
 @pytest.mark.asyncio
@@ -447,7 +555,8 @@ def _capture_cooldowns(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_429_honored_retry_publishes_cooldown(monkeypatch):
-    """The honored-retry path publishes the (interval-floored) cooldown."""
+    """The honored-retry path publishes the server's Retry-After as the cooldown,
+    before sleeping (the interval is enforced separately by the re-pace)."""
     monkeypatch.setattr(arxiv_pacing.settings, "ARXIV_MIN_REQUEST_INTERVAL", 0.3)
     cooldowns = _capture_cooldowns(monkeypatch)
 
@@ -462,7 +571,7 @@ async def test_429_honored_retry_publishes_cooldown(monkeypatch):
     response = await _rate_limited_get(client, "https://example.test/q")
 
     assert response.status_code == 200
-    # max(retry_after=1, interval=0.3) == 1.0, published before the sleep.
+    # cooldown == raw retry_after (1.0), published before the sleep.
     assert cooldowns == [1.0]
 
 

@@ -17,7 +17,6 @@ from .arxiv_pacing import (
     pace_arxiv_request,
     record_arxiv_request,
     record_arxiv_cooldown,
-    _min_interval as _arxiv_min_interval,
 )
 
 logger = logging.getLogger("arxiv-mcp-pro")
@@ -94,14 +93,17 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
     """Make a GET request respecting arXiv's rate limit policy.
 
     Paces via the cross-process arXiv pacer (:func:`pace_arxiv_request`) so
-    sibling agent sessions on one machine stay under arXiv's per-IP limit. On
-    429/503, honours a short ``Retry-After`` (<= 30s) with a single retry;
-    otherwise fails fast with an honest, actionable message (retrying while
-    rate-limited only extends the ban). One retry on timeout only.
+    sibling agent sessions on one machine stay under arXiv's per-IP limit. EVERY
+    outbound GET is paced — the initial attempt, the timeout retry, and the
+    429-retry. On 429/503, honours a short ``Retry-After`` (<= 30s) with a single
+    retry; otherwise fails fast with an honest, actionable message (retrying
+    while rate-limited only extends the ban). One retry on timeout only.
     """
-    await pace_arxiv_request()
-
     for attempt in range(2):  # one retry on timeout only
+        # Pace at the TOP of each iteration so both the initial attempt and the
+        # timeout retry go through the gate (a raised interval must not be
+        # undercut by the fixed 5s timeout backoff).
+        await pace_arxiv_request()
         try:
             response = await client.get(url, headers=ARXIV_HEADERS)
             if response.status_code in (429, 503):
@@ -112,19 +114,18 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
                         response.status_code,
                         retry_after,
                     )
-                    # Floor the wait at the configured interval so the retry is
-                    # itself paced: Retry-After of 0 / negative / a past HTTP-date
-                    # all parse to 0.0 and would otherwise fire an immediate
-                    # second request at a server already signalling distress.
-                    # (With pacing disabled the floor is 0 — request unchanged.)
-                    cooldown = max(retry_after, _arxiv_min_interval())
-                    # Publish the shared back-off BEFORE we sleep so sibling
+                    # Publish the shared back-off BEFORE sleeping so sibling
                     # coroutines/processes stop firing immediately, not only after
                     # they each independently hit their own 429.
-                    record_arxiv_cooldown(cooldown)
-                    await asyncio.sleep(cooldown)
-                    # Bump the pacer clock so sibling lanes back off too.
-                    record_arxiv_request()
+                    record_arxiv_cooldown(retry_after)
+                    # Sleep just the server's Retry-After; the interval is enforced
+                    # by the re-pace below (so no need to floor here — a
+                    # Retry-After of 0 still can't fire an immediate retry).
+                    await asyncio.sleep(retry_after)
+                    # Re-pace the retry GET: enforces the interval AND honors any
+                    # cooldown published meanwhile, so N callers that slept the
+                    # same header don't retry in a thundering herd.
+                    await pace_arxiv_request()
                     retry_response = await client.get(url, headers=ARXIV_HEADERS)
                     if retry_response.status_code in (429, 503):
                         retry_after2 = _parse_retry_after(

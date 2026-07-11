@@ -69,8 +69,13 @@ _not_before: float = 0.0
 
 # Cross-process lock acquisition is non-blocking, retried in a short sleep loop,
 # and bounded so a wedged sibling can never hang a request indefinitely.
-_LOCK_ACQUIRE_TIMEOUT = 60.0  # seconds
+_LOCK_ACQUIRE_TIMEOUT = 60.0  # seconds (floor; scaled with interval, see below)
 _LOCK_POLL_INTERVAL = 0.1  # seconds
+
+# Liveness cap on the re-check sleep loops (cooldown re-check and the
+# cross-process gate's mtime re-stat): each extra iteration requires a fresh
+# external event, so a well-behaved system converges in one or two passes.
+_RECHECK_MAX_ITERS = 10
 
 # errnos that mean "the lock is held by someone else" (transient contention) —
 # worth retrying. Anything else (ENOLCK on NFS, EPERM, EBADF, ...) means locking
@@ -147,13 +152,12 @@ def _cooldown_remaining_inprocess() -> float:
     return max(0.0, _not_before - time.monotonic())
 
 
-def _cooldown_remaining_file() -> float:
-    """Seconds until the cross-process cooldown deadline (>= 0), lock-free.
+def _read_cooldown_not_before() -> float:
+    """Absolute wall-clock ``not_before`` published in the cooldown file (>= 0).
 
-    Reads the cooldown file's content (a single wall-clock ``not_before``
-    float). Missing file, garbage content, or any read error → 0.0 (no cooldown,
+    Missing file, garbage content, or any read error → 0.0 (no cooldown,
     fail-open). A benign "no cooldown yet" (FileNotFoundError) is silent; an
-    unexpected OSError warns once.
+    unexpected OSError warns once. Lock-free.
     """
     try:
         raw = _cooldown_path().read_bytes()
@@ -163,23 +167,33 @@ def _cooldown_remaining_file() -> float:
         _warn_fail_open_once("cooldown read", exc)
         return 0.0
     try:
-        not_before = float(raw.strip())
+        return max(0.0, float(raw.strip()))
     except (ValueError, TypeError):
         return 0.0
-    return max(0.0, not_before - time.time())
+
+
+def _cooldown_remaining_file() -> float:
+    """Seconds until the cross-process cooldown deadline (>= 0), lock-free."""
+    return max(0.0, _read_cooldown_not_before() - time.time())
 
 
 def _write_cooldown_file(not_before: float) -> None:
-    """Atomically publish ``not_before`` (wall clock) to the cooldown file.
+    """Atomically publish ``not_before`` (wall clock), never SHORTENING an
+    existing deadline (monotonic-max).
 
-    Temp file in the same dir + :func:`os.replace` so a concurrent lock-free
-    reader never sees a torn value. Raises OSError on failure (caller handles).
+    A later, smaller cooldown (e.g. a 60s default) must not clobber an earlier
+    larger one (e.g. a 120s Retry-After) — so we read the current value and write
+    ``max(existing, requested)``. Temp file + :func:`os.replace` so a concurrent
+    lock-free reader never sees a torn value. The read-modify-write is itself
+    lock-free (cooldown is best-effort); a rare interleaving can lose an update
+    but never corrupts the file. Raises OSError on write failure (caller handles).
     """
+    target = max(float(not_before), _read_cooldown_not_before())
     path = _cooldown_path()
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp, "w") as fh:
-            fh.write(repr(float(not_before)))
+            fh.write(repr(target))
         os.replace(tmp, str(path))
     except OSError:
         try:
@@ -189,18 +203,32 @@ def _write_cooldown_file(not_before: float) -> None:
         raise
 
 
-def _acquire_file_lock(fd: int) -> bool:
+def _lock_acquire_timeout(interval: float) -> float:
+    """Effective lock-acquisition deadline (seconds) for the given interval.
+
+    A sibling can legitimately hold the lock for one full interval while it
+    sleeps out its own pacing, so the fixed 60s floor is too short once the
+    configured interval approaches or exceeds it (queued callers would fail open
+    early and violate pacing). Scale to ``2 * interval`` — room for the holder's
+    wait plus our turn. Deep multi-process queues can still exceed this and fail
+    open; that is the documented liveness valve, scaled rather than removed.
+    """
+    return max(_LOCK_ACQUIRE_TIMEOUT, 2.0 * interval)
+
+
+def _acquire_file_lock(fd: int, interval: float) -> bool:
     """Acquire an exclusive advisory lock on ``fd``.
 
-    Non-blocking attempts in a poll loop, bounded at ``_LOCK_ACQUIRE_TIMEOUT``.
-    Returns True if the lock was acquired, False on timeout (caller proceeds
-    without the lock — fail-open). If no advisory-locking primitive is available
-    on this platform, returns False so the caller degrades gracefully.
+    Non-blocking attempts in a poll loop, bounded at
+    ``_lock_acquire_timeout(interval)``. Returns True if the lock was acquired,
+    False on timeout (caller proceeds without the lock — fail-open). If no
+    advisory-locking primitive is available on this platform, returns False so
+    the caller degrades gracefully.
     """
     if not (_HAVE_FCNTL or _HAVE_MSVCRT):
         return False
 
-    deadline = time.monotonic() + _LOCK_ACQUIRE_TIMEOUT
+    deadline = time.monotonic() + _lock_acquire_timeout(interval)
     while True:
         try:
             if _HAVE_FCNTL:
@@ -244,11 +272,11 @@ def _cross_process_gate(interval: float) -> None:
     path = _lock_path()
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        if not _acquire_file_lock(fd):
+        if not _acquire_file_lock(fd, interval):
             logger.warning(
                 "arXiv cross-process lock not acquired within %.0fs; proceeding "
                 "without cross-process pacing",
-                _LOCK_ACQUIRE_TIMEOUT,
+                _lock_acquire_timeout(interval),
             )
             return
         try:
@@ -259,7 +287,7 @@ def _cross_process_gate(interval: float) -> None:
             # interval has elapsed since the last request. Capped for liveness —
             # each extra iteration requires a *fresh* external bump, so a
             # well-behaved system converges in one or two passes.
-            for _ in range(10):
+            for _ in range(_RECHECK_MAX_ITERS):
                 # The file's mtime is the wall-clock time of the last global
                 # request. A stat failure is treated as "no prior request" (0).
                 try:
@@ -288,33 +316,53 @@ def _cross_process_gate(interval: float) -> None:
         os.close(fd)
 
 
+async def _cooldown_remaining() -> float:
+    """Seconds to wait for the shared cooldown across both channels (>= 0).
+
+    Reads the in-process deadline (cheap) and the lock-free file (off the loop),
+    takes the max, and caps at ``_COOLDOWN_CAP``. Fail-open on file errors.
+    """
+    remaining = _cooldown_remaining_inprocess()
+    try:
+        remaining = max(remaining, await asyncio.to_thread(_cooldown_remaining_file))
+    except OSError as exc:  # fail-open: cooldown is best-effort
+        _warn_fail_open_once("cooldown read", exc)
+    return min(remaining, _COOLDOWN_CAP)
+
+
 async def pace_arxiv_request() -> None:
     """Pace an outbound arXiv API request across coroutines and processes.
 
     Call immediately before an arXiv API request. With the interval at 0 all
-    pacing is disabled (no waiting, no lock file). Otherwise: acquire the
-    in-process lock, apply the in-process monotonic gate, then run the
-    cross-process gate off the event loop. Fail-open — any cross-process error
-    leaves the in-process pacing in force and never raises.
+    pacing is disabled (no waiting, no lock file). Otherwise: honor the shared
+    cooldown, then acquire the in-process lock, re-check the cooldown, apply the
+    in-process monotonic gate, and run the cross-process gate off the event loop.
+    Fail-open — any cross-process error leaves the in-process pacing in force and
+    never raises.
     """
     interval = _min_interval()
     if interval <= 0:
         return
 
     global _last_request_time
-    # Cooldown channel (shared 429 back-off), honored BEFORE the locked gate so a
-    # cooldown is respected even while another lane holds the interval lock. Read
-    # both channels: in-process (cheap) and the lock-free file (off the loop).
-    remaining = _cooldown_remaining_inprocess()
-    try:
-        remaining = max(remaining, await asyncio.to_thread(_cooldown_remaining_file))
-    except OSError as exc:  # fail-open: cooldown is best-effort
-        _warn_fail_open_once("cooldown read", exc)
-    remaining = min(remaining, _COOLDOWN_CAP)
+    # Fast-path cooldown check (pre-lock) so a lane backs off before even queuing
+    # for the interval lock. Honored BEFORE the locked gate so a cooldown is
+    # respected even while another lane holds the lock.
+    remaining = await _cooldown_remaining()
     if remaining > 0:
         await asyncio.sleep(remaining)
 
     async with _request_lock:
+        # Re-check the cooldown AFTER acquiring the lock (FIX-B): a caller queued
+        # behind the lock for seconds would otherwise miss a cooldown published
+        # while it waited (the pre-lock snapshot is stale). Loop check → sleep →
+        # re-check until clear, bounded for liveness.
+        for _ in range(_RECHECK_MAX_ITERS):
+            remaining = await _cooldown_remaining()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(remaining)
+
         # In-process gate (cheap, always correct within this process).
         elapsed = time.monotonic() - _last_request_time
         if elapsed < interval:
@@ -371,7 +419,8 @@ def record_arxiv_cooldown(seconds: float) -> None:
         capped = 0.0
 
     now_mono = time.monotonic()
-    _not_before = now_mono + capped
+    # Never shorten an in-flight cooldown (monotonic-max), mirroring the file.
+    _not_before = max(_not_before, now_mono + capped)
     _last_request_time = now_mono
 
     if _min_interval() <= 0:
