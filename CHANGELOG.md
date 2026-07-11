@@ -10,8 +10,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-Repo polish after the v0.7.0 PyPI release. Documentation, CI, and contributor
-tooling only — **no runtime code changes.**
+Repo polish after the v0.7.0 PyPI release, plus reliability/ergonomics fixes
+driven by multi-agent field use.
 
 ### Added
 - Contributor scaffolding: `CONTRIBUTING.md`, GitHub issue templates (bug / feature),
@@ -34,6 +34,10 @@ tooling only — **no runtime code changes.**
   (→ *Model Context Protocol*), listed only 4 of the ~10 tool modules, and documented
   non-existent `ARXIV_*`-prefixed env vars; `AGENTS.md` (previously stale instructions for a
   removed tool) is now a lean, tracked agent guide.
+- `semantic_search`'s missing-dependency hint (tool description + runtime error) now
+  gives the published-package command (`pip install "arxiv-mcp-pro[pro]"`) instead of
+  the source-checkout-only `uv pip install -e ".[pro]"`, which fails for pip/uvx
+  installs (B15).
 
 ## [0.7.0] - 2026-06-27
 

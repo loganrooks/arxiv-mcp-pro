@@ -63,7 +63,8 @@ semantic_search_tool = types.Tool(
         "Opt-in pagination: set `offset` to page through ranked results (page size = max_results); "
         "set `compact` to drop the full abstract from each result and cut token cost. When either is set, "
         "the response adds `offset`/`total_available`/`next_offset`. Omit both for full, unpaged output. "
-        'Requires pro dependencies: uv pip install -e ".[pro]"'
+        'Requires the [pro] extra: pip install "arxiv-mcp-pro[pro]" '
+        '(from a source checkout: uv pip install -e ".[pro]").'
     ),
     inputSchema={
         "type": "object",
@@ -122,7 +123,8 @@ def _dependency_error() -> Optional[str]:
     if np is None or SentenceTransformer is None:
         return (
             "Pro feature dependency missing. Install with: "
-            '`uv pip install -e ".[pro]"`'
+            '`pip install "arxiv-mcp-pro[pro]"` '
+            '(from a source checkout: `uv pip install -e ".[pro]"`)'
         )
     return None
 
