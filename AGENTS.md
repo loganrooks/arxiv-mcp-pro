@@ -34,6 +34,14 @@ source .venv/bin/activate
 
 The `pre-push` hook runs the full pytest suite; expect a push to take as long as the tests do.
 
+## Parallel / multi-agent runs
+
+arXiv rate-limits per IP (≈1 request / 3s), globally — not per process. Multiple sessions on
+one machine coordinate their arXiv API calls through a lock file in the storage dir
+(`<storage-path>/arxiv_api.lock`), so a fleet that shares a storage dir stays under the limit
+automatically. Tune with `ARXIV_MIN_REQUEST_INTERVAL` (default `3` seconds; `0` disables
+pacing, including the lock file). Multiple machines behind one IP remain uncoordinated.
+
 ## Review
 
 Changes are reviewed per `docs/governance/review-protocol.md` (risk-routed; producer never

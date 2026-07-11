@@ -12,6 +12,7 @@ import mcp.types as types
 from mcp.types import ToolAnnotations
 from ..config import Settings, get_arxiv_client
 from .content import add_content_payload
+from .arxiv_pacing import pace_arxiv_request, record_arxiv_request
 import logging
 
 _MAX_TRACKED_CONVERSIONS = 100  # prevent unbounded growth of conversion_statuses
@@ -389,7 +390,16 @@ async def handle_download(arguments: Dict[str, Any]) -> List[types.TextContent]:
             ]
 
         logger.info(f"Falling back to PDF download for {paper_id}")
-        markdown, arxiv_result = await asyncio.to_thread(_fetch_pdf_content, paper_id)
+        # _fetch_pdf_content makes an arXiv API metadata call (client.results)
+        # before streaming the PDF. Pace against sibling sessions before, and
+        # record after. (The PDF content stream itself is out of scope — B10.)
+        await pace_arxiv_request()
+        try:
+            markdown, arxiv_result = await asyncio.to_thread(
+                _fetch_pdf_content, paper_id
+            )
+        finally:
+            record_arxiv_request()
 
         # Save to cache
         md_path.write_text(markdown, encoding="utf-8")

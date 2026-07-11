@@ -71,6 +71,8 @@ Everything else is read from environment variables whose names match the `Settin
 `config.py` — pydantic-settings, **no prefix** (not `ARXIV_*`) — all optional:
 - `MAX_RESULTS`: search results limit (default: 50)
 - `REQUEST_TIMEOUT`: arXiv API timeout in seconds (default: 60)
+- `ARXIV_MIN_REQUEST_INTERVAL`: minimum seconds between arXiv API requests, coordinated
+  across processes via a lock file in the storage dir (default: 3; `0` disables pacing)
 - `TRANSPORT` / `HOST` / `PORT`: transport and HTTP bind (defaults: `stdio` / `127.0.0.1` / `8000`)
 - `SEMANTIC_SCHOLAR_API_KEY`, `SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL`, `CITATION_MAX_EDGES`: citation/influence tuning
 

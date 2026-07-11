@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     # ~1 request/second across all endpoints; set this to ~1.1 to pace requests
     # proactively instead of bursting and relying on 429 retry/backoff.
     SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL: float = 0.0
+    # Minimum seconds between arXiv API requests (arXiv asks for >= 3s per IP,
+    # globally — not per process). The pacer coordinates sibling sessions on one
+    # machine through a lock file in STORAGE_PATH, so parallel/multi-agent use on
+    # a shared storage dir stays under the limit. `0` disables all arXiv pacing,
+    # including the cross-process lock file. Multiple machines behind one IP
+    # remain uncoordinated (see the README "Parallel / multi-agent use" note).
+    ARXIV_MIN_REQUEST_INTERVAL: float = 3.0
     model_config = SettingsConfigDict(extra="allow")
 
     @property
