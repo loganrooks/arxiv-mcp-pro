@@ -126,7 +126,16 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
                     # cooldown published meanwhile, so N callers that slept the
                     # same header don't retry in a thundering herd.
                     await pace_arxiv_request()
-                    retry_response = await client.get(url, headers=ARXIV_HEADERS)
+                    # Wrap the retry GET's own timeout so it does NOT bubble to the
+                    # outer for-loop handler and fire a THIRD request into the
+                    # cooldown window — the single-retry contract stops here.
+                    try:
+                        retry_response = await client.get(url, headers=ARXIV_HEADERS)
+                    except httpx.TimeoutException:
+                        raise RuntimeError(
+                            "arXiv retry after rate-limit cooldown timed out — "
+                            "not retrying further"
+                        )
                     if retry_response.status_code in (429, 503):
                         retry_after2 = _parse_retry_after(
                             retry_response.headers.get("Retry-After")

@@ -293,6 +293,56 @@ async def test_cooldown_never_shortens_deadline(paced, monkeypatch):
     assert arxiv_pacing._not_before == pytest.approx(long_inproc)
 
 
+@pytest.mark.asyncio
+async def test_cooldown_write_converges_on_concurrent_shorter(paced, monkeypatch):
+    """FIX-1: if a competing shorter publish lands right after our os.replace, the
+    verify-and-retry converges the file back to the longer deadline."""
+    cooldown_file = paced / "arxiv_api.cooldown"
+    long_deadline = time.time() + 120.0
+    short_deadline = time.time() + 5.0
+
+    real_replace = arxiv_pacing.os.replace
+    injected = {"done": False}
+
+    def _replace_then_clobber(src, dst):
+        real_replace(src, dst)
+        if not injected["done"]:
+            injected["done"] = True  # simulate a competing shorter writer landing
+            cooldown_file.write_text(repr(short_deadline))
+
+    monkeypatch.setattr(arxiv_pacing.os, "replace", _replace_then_clobber)
+
+    arxiv_pacing._write_cooldown_file(long_deadline)
+
+    # Converged: the file keeps the longer deadline despite the mid-write clobber.
+    assert float(cooldown_file.read_text()) == pytest.approx(long_deadline)
+
+
+@pytest.mark.asyncio
+async def test_inlock_cooldown_wait_is_bounded_by_cap(paced, monkeypatch):
+    """FIX-4: a persistently far-future cooldown (corrupt file / clock step) is
+    bounded to ~one cap of cumulative in-lock wait, not cap × iterations."""
+    _set_interval(monkeypatch, 0.3)
+    monkeypatch.setattr(arxiv_pacing, "_COOLDOWN_CAP", 0.5)
+    _quiesce_interval_gate(paced)  # old lock mtime → the interval gate adds no wait
+    monkeypatch.setattr(arxiv_pacing, "_last_request_time", 0.0)
+    # A far-future in-process cooldown that never clears.
+    monkeypatch.setattr(arxiv_pacing, "_not_before", time.monotonic() + 10_000)
+
+    slept = []
+
+    async def _fake_sleep(secs):
+        slept.append(secs)
+
+    monkeypatch.setattr(arxiv_pacing.asyncio, "sleep", _fake_sleep)
+
+    await arxiv_pacing.pace_arxiv_request()
+
+    # Pre-lock (<= one cap) + in-lock (bounded to one cap by FIX-4) <= 2 caps;
+    # without the bound the in-lock loop alone would sleep ~10 caps.
+    assert sum(slept) <= 2 * 0.5 + 0.05, f"unbounded cooldown wait: {slept}"
+
+
 def test_lock_acquire_timeout_scales_with_interval():
     """FIX-D: the effective lock-acquisition deadline is max(60, 2*interval)."""
     assert arxiv_pacing._lock_acquire_timeout(3.0) == 60.0  # floor dominates
@@ -365,6 +415,42 @@ def test_cross_process_gate_recheck_is_capped(paced, monkeypatch):
     arxiv_pacing._cross_process_gate(interval)
 
     assert len(calls) == 10  # capped, does not hang
+
+
+def test_cross_process_gate_verifies_before_break(paced, monkeypatch):
+    """FIX-3: a lock-free mtime bump between the passing age-check and the utime
+    is caught by the verification re-stat — one more wait iteration occurs
+    instead of proceeding on the stale check.
+
+    Deterministic: os.fstat is scripted so the first passing check is followed by
+    a verify that sees a *moved* (fresh) mtime, forcing the loop to re-evaluate
+    and wait one interval that a naive break would have skipped.
+    """
+    interval = 0.3
+    _set_interval(monkeypatch, interval)
+    lock_file = paced / "arxiv_api.lock"
+    lock_file.touch()
+
+    now = time.time()
+    old = now - 10  # age >= interval → passes the age check
+    fresh = now  # a just-recorded request (age ~0 → must wait)
+
+    class _Stat:
+        def __init__(self, m):
+            self.st_mtime = m
+
+    # check→old (pass), verify→fresh (moved!→continue), check→fresh (age~0→sleep),
+    # check→old (converged), verify→old (stable→break).
+    seq = iter([old, fresh, fresh, old, old])
+    monkeypatch.setattr(arxiv_pacing.os, "fstat", lambda fd: _Stat(next(seq, old)))
+
+    calls = []
+    monkeypatch.setattr(arxiv_pacing.time, "sleep", lambda s: calls.append(s))
+
+    arxiv_pacing._cross_process_gate(interval)
+
+    # A naive break (no verification) would proceed with zero sleeps.
+    assert len(calls) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +570,29 @@ async def test_retry_after_zero_still_paces_retry(monkeypatch):
     assert client.get.await_count == 2
     assert len(pace_calls) == 2  # retry is paced, not fired immediately
     assert slept == [0.0]  # sleep is the raw Retry-After (no interval floor)
+
+
+@pytest.mark.asyncio
+async def test_429_retry_timeout_does_not_triple_request(monkeypatch):
+    """FIX-2: a TimeoutException on the 429-retry GET fails fast with a clear
+    error and does NOT re-enter the outer loop for a third request."""
+    _count_pace_calls(monkeypatch)  # neutralise pacer/recorders (no real storage)
+
+    async def _fake_sleep(secs):
+        pass
+
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.asyncio.sleep", _fake_sleep)
+
+    client = MagicMock()
+    client.get = AsyncMock(
+        side_effect=[_resp(429, {"Retry-After": "1"}), httpx.TimeoutException("boom")]
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await _rate_limited_get(client, "https://example.test/q")
+
+    assert "timed out" in str(excinfo.value)
+    assert client.get.await_count == 2  # initial + one retry, never a third
 
 
 @pytest.mark.asyncio

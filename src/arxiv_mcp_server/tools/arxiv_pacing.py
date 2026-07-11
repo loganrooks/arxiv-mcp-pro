@@ -179,28 +179,44 @@ def _cooldown_remaining_file() -> float:
 
 def _write_cooldown_file(not_before: float) -> None:
     """Atomically publish ``not_before`` (wall clock), never SHORTENING an
-    existing deadline (monotonic-max).
+    existing deadline (monotonic-max), with verify-and-retry convergence.
 
     A later, smaller cooldown (e.g. a 60s default) must not clobber an earlier
     larger one (e.g. a 120s Retry-After) — so we read the current value and write
-    ``max(existing, requested)``. Temp file + :func:`os.replace` so a concurrent
-    lock-free reader never sees a torn value. The read-modify-write is itself
-    lock-free (cooldown is best-effort); a rare interleaving can lose an update
-    but never corrupts the file. Raises OSError on write failure (caller handles).
+    ``max(existing, requested)``. The read-modify-write is lock-free, so two
+    concurrent publishers can both read the old value and the shorter one can
+    ``os.replace`` last, losing the longer deadline. To converge without a lock:
+    after each replace, re-read; if the file is now shorter than the deadline
+    *this* call intended to guarantee, another writer clobbered us — redo the
+    read-max-write. Bounded at 3 attempts; on exhaustion, proceed fail-open
+    (cooldown is best-effort). Temp file + :func:`os.replace` keeps a concurrent
+    lock-free reader from ever seeing a torn value. Raises OSError on write
+    failure (caller handles).
     """
-    target = max(float(not_before), _read_cooldown_not_before())
+    guarantee = float(not_before)
     path = _cooldown_path()
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(tmp, "w") as fh:
-            fh.write(repr(target))
-        os.replace(tmp, str(path))
+        for _ in range(3):
+            target = max(guarantee, _read_cooldown_not_before())
+            with open(tmp, "w") as fh:
+                fh.write(repr(target))
+            os.replace(tmp, str(path))
+            # Verify a concurrent shorter publish didn't land after ours.
+            if _read_cooldown_not_before() >= guarantee:
+                return
     except OSError:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+    # Could not confirm our deadline stuck after 3 passes — a sibling under-backs
+    # off by the difference; acceptable for a best-effort channel.
+    _warn_fail_open_once(
+        "cooldown converge",
+        OSError("cooldown deadline not confirmed after 3 write attempts"),
+    )
 
 
 def _lock_acquire_timeout(interval: float) -> float:
@@ -296,7 +312,19 @@ def _cross_process_gate(interval: float) -> None:
                     mtime = 0.0
                 age = time.time() - mtime
                 if age >= interval:
-                    break  # a full interval has elapsed since the last request
+                    # A full interval has elapsed — but a lock-free
+                    # record_arxiv_request bump could have landed between this
+                    # passing check and our utime, which would let us send
+                    # without pacing off that just-recorded request (FIX-3).
+                    # Verify with one more fstat; if the mtime moved, re-loop
+                    # (against the same budget) to re-evaluate the fresh mtime.
+                    try:
+                        verify_mtime = os.fstat(fd).st_mtime
+                    except OSError:
+                        verify_mtime = mtime
+                    if verify_mtime == mtime:
+                        break  # stable → safe to proceed
+                    continue  # a bump landed; re-evaluate
                 # Clamp a future mtime (age < 0 — clock skew / NTP step-back /
                 # coarse-FS rounding) to at most one interval (MAJOR-1); a genuine
                 # recent-past mtime waits only its remainder.
@@ -305,6 +333,9 @@ def _cross_process_gate(interval: float) -> None:
                     # Skew won't resolve by re-checking, and MAJOR-1 caps its cost
                     # at one interval — don't re-loop (which would sleep again).
                     break
+            # The µs window between the verifying fstat and the utime below is the
+            # irreducible cost of the lock-free record channel — a bump landing
+            # there is not observed by this request.
             # Mark this request as the new "last global request".
             try:
                 os.utime(str(path), None)
@@ -357,11 +388,24 @@ async def pace_arxiv_request() -> None:
         # behind the lock for seconds would otherwise miss a cooldown published
         # while it waited (the pre-lock snapshot is stale). Loop check → sleep →
         # re-check until clear, bounded for liveness.
+        slept_total = 0.0
         for _ in range(_RECHECK_MAX_ITERS):
             remaining = await _cooldown_remaining()
             if remaining <= 0:
                 break
+            # Bound the CUMULATIVE in-lock wait at one cap (FIX-4): a persistently
+            # far-future not_before (corrupt file / clock step) must not park
+            # every arXiv call in this process for cap × iterations while holding
+            # the lock. Once a full cap has been waited, proceed (fail-open).
+            remaining = min(remaining, _COOLDOWN_CAP - slept_total)
+            if remaining <= 0:
+                _warn_fail_open_once(
+                    "cooldown wait",
+                    OSError("cumulative in-lock cooldown wait hit the cap"),
+                )
+                break
             await asyncio.sleep(remaining)
+            slept_total += remaining
 
         # In-process gate (cheap, always correct within this process).
         elapsed = time.monotonic() - _last_request_time
