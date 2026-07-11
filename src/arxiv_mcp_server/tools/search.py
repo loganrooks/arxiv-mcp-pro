@@ -335,6 +335,10 @@ DATE FILTERING: Use YYYY-MM-DD format for historical research:
 - date_to: "2015-12-31" - for foundational/classic work (pre-2016)
 - date_from: "2020-01-01" - for recent developments (post-2020)
 - Both together for specific time periods
+- Filters bind to arXiv's submittedDate — the ORIGINAL (v1) submission timestamp. For
+  cross-listed or revised papers this can differ from the arXiv-ID prefix month and from
+  the latest-version date, so papers near a boundary may appear to leak in or out of the
+  window. For strict windows, widen the range slightly and verify each hit's published field.
 
 RESULT QUALITY: Default sort is RELEVANCE (most pertinent results first). Use sort_by: "date" to get newest papers first.
 Choose relevance for focused topic searches; choose date for monitoring recent developments.
@@ -359,11 +363,11 @@ TIPS FOR FOUNDATIONAL RESEARCH:
             },
             "date_from": {
                 "type": "string",
-                "description": "Start date for papers (YYYY-MM-DD format). Use to find recent work, e.g., '2023-01-01' for last 2 years.",
+                "description": "Start date for papers (YYYY-MM-DD format), inclusive. Binds to the original (v1) submission timestamp — see DATE FILTERING in the tool description. Use to find recent work, e.g., '2023-01-01' for last 2 years.",
             },
             "date_to": {
                 "type": "string",
-                "description": "End date for papers (YYYY-MM-DD format). Use with date_from to find historical work, e.g., '2020-12-31' for older research.",
+                "description": "End date for papers (YYYY-MM-DD format), inclusive. Binds to the original (v1) submission timestamp — see DATE FILTERING in the tool description. Use with date_from to find historical work, e.g., '2020-12-31' for older research.",
             },
             "categories": {
                 "type": "array",

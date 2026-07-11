@@ -25,6 +25,11 @@ driven by multi-agent field use.
   follow-up); removed the dead `master` branch triggers and leftover template comments.
 
 ### Fixed
+- `search_papers` now documents which timestamp `date_from`/`date_to` bind to: arXiv's
+  `submittedDate`, the original (v1) submission time — which can differ from the arXiv-ID
+  prefix month and the latest-version date on cross-listed/revised papers, so strict
+  windows should be widened slightly and hits verified against their `published` field
+  (B18).
 - README no longer claims a PyPI package is "planned for a future release" — the package
   shipped to PyPI on 2026-07-05. Install docs now lead with `pip install arxiv-mcp-pro` /
   `uvx arxiv-mcp-pro`, a PyPI version badge is added, the macOS `.mcpb` desktop bundle on
