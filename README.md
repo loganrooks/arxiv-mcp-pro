@@ -336,6 +336,7 @@ Configure through command-line options and environment variables:
 | `--storage-path` | Paper storage location | `~/.arxiv-mcp-server/papers` |
 | `MAX_RESULTS` | Maximum search results | `50` |
 | `REQUEST_TIMEOUT` | API timeout in seconds | `60` |
+| `CONTENT_DEFAULT_MAX_CHARS` | Default cap on paper characters returned by `read_paper` / `download_paper` when the caller omits `max_chars` (responses include `is_truncated` / `next_start` for paging). An explicit `max_chars` always wins; `0` disables the default cap (full content). | `60000` |
 | `TRANSPORT` | Transport type: `stdio`, `http`, or `streamable-http` | `stdio` |
 | `HOST` | Host to bind to in HTTP mode | `127.0.0.1` |
 | `PORT` | Port to listen on in HTTP mode | `8000` |

@@ -151,7 +151,9 @@ download_tool = types.Tool(
         "Download a paper from arXiv and return its text content. "
         "Tries the HTML version first for clean extraction; falls back to "
         "PDF conversion if HTML is unavailable. Stores the paper locally "
-        "and supports start/max_chars pagination for very large papers."
+        "with start/max_chars pagination. Large papers are returned in capped "
+        "chunks by default (server default 60000 chars) — check `is_truncated` "
+        "and follow `next_start` to page through the rest."
     ),
     inputSchema={
         "type": "object",
@@ -168,7 +170,7 @@ download_tool = types.Tool(
             "max_chars": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Maximum raw paper characters to return from start; omit for full content",
+                "description": "Maximum raw paper characters to return from start. When omitted, the server's default cap applies (CONTENT_DEFAULT_MAX_CHARS, default 60000; 0 disables). Pass an explicit value to override.",
             },
         },
         "required": ["paper_id"],

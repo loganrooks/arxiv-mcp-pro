@@ -33,6 +33,13 @@ driven by multi-agent field use.
   missing source paper, and the `reindex` loop (each uses a fresh `arxiv.Client()`).
 
 ### Changed
+- **`read_paper` / `download_paper` now cap the default content return** at
+  `CONTENT_DEFAULT_MAX_CHARS` (60000 chars) when `max_chars` is omitted (B12).
+  Uncapped whole-paper defaults (~137k chars observed) overflowed MCP clients'
+  per-tool-output limits and blocked the read path entirely. Responses have
+  always carried `is_truncated` / `next_start`, so capped reads are pageable;
+  an explicit `max_chars` still wins, and setting the env var to `0` restores
+  the legacy full-content default.
 - CI tuning: added `concurrency` (auto-cancel superseded runs) to the `CI`, `Lint`,
   and `Run Tests` workflows, and pip dependency caching to `CI` and `Lint` (the `Run
   Tests` matrix installs via `uv`, so pip caching does not apply — a uv cache is a

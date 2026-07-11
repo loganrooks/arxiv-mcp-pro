@@ -60,3 +60,30 @@ async def test_read_paper_reports_end_of_content_for_final_chunk(
     assert result["next_start"] is None
     assert result["is_truncated"] is False
     assert result["content"].endswith("uvwxyz")
+
+
+@pytest.mark.asyncio
+async def test_read_paper_default_cap_when_max_chars_omitted(
+    temp_storage_path, monkeypatch
+):
+    """Omitting max_chars applies the server default cap with a paging cursor (B12)."""
+    from arxiv_mcp_server.tools import content as content_mod
+
+    monkeypatch.setattr(
+        read_module.settings,
+        "_get_storage_path_from_args",
+        lambda: temp_storage_path,
+    )
+    monkeypatch.setattr(content_mod.settings, "CONTENT_DEFAULT_MAX_CHARS", 50)
+    paper_id = "2505.13525"
+    content = "z" * 200
+    (temp_storage_path / f"{paper_id}.md").write_text(content, encoding="utf-8")
+
+    response = await handle_read_paper({"paper_id": paper_id})
+    result = json.loads(response[0].text)
+
+    assert result["status"] == "success"
+    assert result["returned_chars"] == 50
+    assert result["is_truncated"] is True
+    assert result["next_start"] == 50
+    assert result["content_length"] == 200
