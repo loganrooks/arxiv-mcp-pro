@@ -17,6 +17,13 @@ driven by multi-agent field use.
 - Contributor scaffolding: `CONTRIBUTING.md`, GitHub issue templates (bug / feature),
   a pull request template, and a Dependabot config (weekly `pip` + `github-actions`
   updates). Also a committed `.claude/settings.json` with a minimal permissions allowlist.
+- **Cross-process arXiv rate pacing** (B17): all arXiv API calls now pace through a lock
+  file in the storage dir (`arxiv_api.lock`), so multiple sessions on one machine that share
+  a storage dir stay under arXiv's ≈1-request/3s per-IP limit — the failure mode where a
+  fleet of parallel agents drew sustained HTTP 429 cooldowns. New `ARXIV_MIN_REQUEST_INTERVAL`
+  knob (default `3`s; `0` disables all pacing including the lock file). Fail-open: any pacer
+  error degrades to in-process pacing and never breaks a request. See the README
+  "Parallel / multi-agent use" note; multiple machines behind one IP remain uncoordinated.
 
 ### Changed
 - CI tuning: added `concurrency` (auto-cancel superseded runs) to the `CI`, `Lint`,
@@ -38,6 +45,13 @@ driven by multi-agent field use.
   gives the published-package command (`pip install "arxiv-mcp-pro[pro]"`) instead of
   the source-checkout-only `uv pip install -e ".[pro]"`, which fails for pip/uvx
   installs (B15).
+- `search_papers`' non-date (arxiv-library) path no longer free-rides outside the rate
+  pacer — it previously read the pacer clock but never acquired the lock or updated the
+  timestamp, so those searches were effectively unpaced (B17).
+- arXiv rate-limit errors now respect a short `Retry-After` header (≤30s → one retry) and
+  otherwise fail fast with an honest, actionable message (naming the server's requested
+  delay, or noting observed cooldowns can reach ~3 minutes under parallel use) instead of
+  the previous hardcoded "wait 60 seconds" (B17).
 
 ## [0.7.0] - 2026-06-27
 
