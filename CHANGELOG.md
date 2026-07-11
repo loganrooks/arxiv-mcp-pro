@@ -38,8 +38,11 @@ driven by multi-agent field use.
   Uncapped whole-paper defaults (~137k chars observed) overflowed MCP clients'
   per-tool-output limits and blocked the read path entirely. Responses have
   always carried `is_truncated` / `next_start`, so capped reads are pageable;
-  an explicit `max_chars` still wins, and setting the env var to `0` restores
-  the legacy full-content default.
+  an explicit `max_chars` still wins, and setting the env var to `0` (or any
+  non-positive value) restores the legacy full-content default. Note: a
+  schema-violating explicit `max_chars` (`0`, negative — the schema minimum
+  is 1) is ignored and now receives the default cap, where it previously
+  received full content.
 - CI tuning: added `concurrency` (auto-cancel superseded runs) to the `CI`, `Lint`,
   and `Run Tests` workflows, and pip dependency caching to `CI` and `Lint` (the `Run
   Tests` matrix installs via `uv`, so pip caching does not apply — a uv cache is a

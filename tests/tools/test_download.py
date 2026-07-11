@@ -319,3 +319,39 @@ async def test_unexpected_error_returns_error_status(temp_storage_path, mocker):
 
     assert result["status"] == "error"
     assert "Error:" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_default_cap_truncates_response_but_stores_full_content(
+    temp_storage_path, mocker, monkeypatch
+):
+    """The B12 default cap bounds the RESPONSE only — the cached .md file must
+    always hold the complete fetched content (a regression that stored the
+    capped chunk would corrupt the local library silently)."""
+    from arxiv_mcp_server.tools import content as content_mod
+
+    paper_id = "2103.33333"
+
+    def fake_path(pid, suffix=".md"):
+        return temp_storage_path / f"{pid}{suffix}"
+
+    mocker.patch(
+        "arxiv_mcp_server.tools.download.get_paper_path", side_effect=fake_path
+    )
+    monkeypatch.setattr(content_mod.settings, "CONTENT_DEFAULT_MAX_CHARS", 50)
+    html_text = "A" * 300  # well above the cap
+    mocker.patch(
+        "arxiv_mcp_server.tools.download._fetch_html_content",
+        return_value=html_text,
+    )
+
+    response = await handle_download({"paper_id": paper_id})
+    result = json.loads(response[0].text)
+
+    assert result["status"] == "success"
+    assert result["returned_chars"] == 50
+    assert result["is_truncated"] is True
+    assert result["next_start"] == 50
+    # Storage integrity: the cached file carries the FULL content.
+    stored = (temp_storage_path / f"{paper_id}.md").read_text(encoding="utf-8")
+    assert stored == html_text

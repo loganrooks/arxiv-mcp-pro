@@ -22,7 +22,8 @@ read_tool = types.Tool(
     description=(
         "Read the text content of a paper that was previously downloaded via download_paper. "
         "Returns the paper in markdown format with start/max_chars pagination. Large papers are "
-        "returned in capped chunks by default (server default 60000 chars) — check `is_truncated` "
+        "returned in capped chunks by default (60000 chars unless the server's "
+        "CONTENT_DEFAULT_MAX_CHARS overrides it) — check `is_truncated` "
         "and follow `next_start` to page through the rest. "
         "Will fail with a clear error if the paper has not been downloaded yet — call download_paper first. "
         "Workflow: search_papers -> download_paper -> read_paper."

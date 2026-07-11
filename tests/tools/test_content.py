@@ -55,8 +55,15 @@ def test_default_cap_pages_consistently_via_next_start(monkeypatch):
     assert third["is_truncated"] is False
 
 
-def test_garbage_default_cap_setting_fails_open(monkeypatch):
-    # A non-numeric env value must not break reads — falls back to uncapped.
+def test_garbage_default_cap_attribute_fails_open(monkeypatch):
+    """A non-numeric cap ATTRIBUTE falls back to uncapped (defense in depth).
+
+    Scope honesty: a garbage CONTENT_DEFAULT_MAX_CHARS *env var* never reaches
+    this code path — pydantic validates types at Settings() instantiation and
+    the server fails to start, the pre-existing behavior for every typed
+    setting (MAX_RESULTS, REQUEST_TIMEOUT, ...). This test covers only the
+    in-process attribute mutation seam.
+    """
     _set_default_cap(monkeypatch, "not-a-number")
     text = "x" * 250
     page = paginate_content(text, {})

@@ -152,7 +152,8 @@ download_tool = types.Tool(
         "Tries the HTML version first for clean extraction; falls back to "
         "PDF conversion if HTML is unavailable. Stores the paper locally "
         "with start/max_chars pagination. Large papers are returned in capped "
-        "chunks by default (server default 60000 chars) — check `is_truncated` "
+        "chunks by default (60000 chars unless the server's "
+        "CONTENT_DEFAULT_MAX_CHARS overrides it) — check `is_truncated` "
         "and follow `next_start` to page through the rest."
     ),
     inputSchema={
