@@ -117,7 +117,7 @@ async def get_prompt(
         optional_ids = f"\nFocus papers: {paper_ids}." if paper_ids else ""
         content = (
             f"Create a literature review on topic: {topic}.{optional_ids}\n\n"
-            "Use search_papers to discover missing papers and read_paper to synthesize evidence.\n\n"
+            "Use search_papers to discover missing papers and read_paper to synthesize evidence (read_paper caps large papers: while is_truncated is true, re-call with start=next_start so evidence covers whole papers, not opening chunks).\n\n"
             f"{LITERATURE_REVIEW_PROMPT}"
         )
 
