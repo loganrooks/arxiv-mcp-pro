@@ -225,7 +225,10 @@ async def test_garbage_cooldown_content_is_ignored(paced, monkeypatch):
     monkeypatch.setattr(arxiv_pacing, "_not_before", 0.0)
     monkeypatch.setattr(arxiv_pacing, "_last_request_time", 0.0)
     _quiesce_interval_gate(paced)
-    (paced / "arxiv_api.cooldown").write_text("not-a-float ☠")
+    # Non-UTF-8 bytes, not just a non-float string: the reader must fail open
+    # on decode errors too (and writing bytes avoids Windows' cp1252 default
+    # encoding choking on exotic characters in the test itself).
+    (paced / "arxiv_api.cooldown").write_bytes(b"not-a-float \xff\xfe\x99")
 
     start = time.monotonic()
     await arxiv_pacing.pace_arxiv_request()  # must not raise
