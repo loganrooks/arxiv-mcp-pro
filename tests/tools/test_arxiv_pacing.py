@@ -772,3 +772,17 @@ def test_rate_limit_message_zero_and_cap():
     capped = _rate_limit_message(429, 10**9)
     assert "86400s" in capped
     assert "1000000000" not in capped
+
+
+def test_min_interval_rejects_non_finite(monkeypatch):
+    """nan/inf intervals would escape the OSError fail-open path via
+    time.sleep raising ValueError/OverflowError — fall back to the default."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        monkeypatch.setattr(arxiv_pacing.settings, "ARXIV_MIN_REQUEST_INTERVAL", bad)
+        assert arxiv_pacing._min_interval() == 3.0
+
+
+def test_parse_retry_after_overflow_is_parse_failure():
+    from arxiv_mcp_server.tools.search import _parse_retry_after
+
+    assert _parse_retry_after("9" * 400) is None

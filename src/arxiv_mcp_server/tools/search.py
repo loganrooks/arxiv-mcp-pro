@@ -43,11 +43,15 @@ def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     value = value.strip()
     if not value:
         return None
-    # Integer-seconds form.
+    # Integer-seconds form. OverflowError: an absurdly large numeric header
+    # (int() is arbitrary-precision; float() overflows) is a parse failure,
+    # not an exception to surface.
     try:
         return max(0.0, float(int(value)))
     except ValueError:
         pass
+    except OverflowError:
+        return None
     # HTTP-date form.
     try:
         dt = parsedate_to_datetime(value)

@@ -40,6 +40,7 @@ Design constraints:
 import asyncio
 import errno
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -129,12 +130,17 @@ def _min_interval() -> float:
     """Return the configured minimum arXiv request interval in seconds.
 
     Read dynamically (not captured at import) so tests and env changes take
-    effect. Any non-numeric value falls back to the 3s default.
+    effect. Any non-numeric or non-finite value (nan/inf would escape the
+    OSError fail-open path via time.sleep raising ValueError/OverflowError)
+    falls back to the 3s default — the pacer must never break a request.
     """
     try:
-        return float(settings.ARXIV_MIN_REQUEST_INTERVAL)
+        interval = float(settings.ARXIV_MIN_REQUEST_INTERVAL)
     except (TypeError, ValueError):
         return 3.0
+    if not math.isfinite(interval):
+        return 3.0
+    return interval
 
 
 def _lock_path() -> Path:

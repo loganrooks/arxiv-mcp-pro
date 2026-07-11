@@ -352,12 +352,16 @@ arXiv rate-limits per IP (≈1 request / 3s), globally — not per process. When
 several sessions run on one machine (e.g. a fleet of agents), they can jointly
 exceed that limit and draw sustained HTTP 429 cooldowns (observed ~3 minutes).
 
-To coordinate, all arXiv API calls pace through a shared lock file in the storage
-directory (`<storage-path>/arxiv_api.lock`), so **sessions that share a storage
-dir automatically stay under the limit** — one request at a time, spaced by
+To coordinate, the arXiv API request paths — `search_papers` (both routes),
+`get_abstract`, `watch_topic`/`check_alerts`, and `download_paper`'s PDF-fallback
+metadata fetch — pace through a shared lock file in the storage directory
+(`<storage-path>/arxiv_api.lock`), so **sessions that share a storage dir stay
+under the limit on those paths** — one request at a time, spaced by
 `ARXIV_MIN_REQUEST_INTERVAL`. Set that to `0` to disable pacing, or raise it to be
-more conservative. Note: coordination is per storage dir; **multiple machines
-behind one IP remain uncoordinated** (each has its own lock file).
+more conservative. Two exceptions (tracked follow-up): the semantic-index metadata
+fetches (`reindex`, background indexing after downloads) are not yet paced. Note:
+coordination is per storage dir; **multiple machines behind one IP remain
+uncoordinated** (each has its own lock file).
 
 ## 🧪 Testing
 
