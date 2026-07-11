@@ -13,7 +13,12 @@ from dateutil import parser
 import mcp.types as types
 from mcp.types import ToolAnnotations
 from ..config import Settings, get_arxiv_client
-from .arxiv_pacing import pace_arxiv_request, record_arxiv_request
+from .arxiv_pacing import (
+    pace_arxiv_request,
+    record_arxiv_request,
+    record_arxiv_cooldown,
+    _min_interval as _arxiv_min_interval,
+)
 
 logger = logging.getLogger("arxiv-mcp-pro")
 settings = Settings()
@@ -58,10 +63,15 @@ def _parse_retry_after(value: Optional[str]) -> Optional[float]:
 
 def _rate_limit_message(status_code: int, retry_after: Optional[float]) -> str:
     """Build an honest, actionable arXiv rate-limit error message."""
-    if retry_after is not None:
+    # A present-but-non-positive Retry-After (0, negative, or a past HTTP-date
+    # all parse to 0.0) carries no useful "wait N seconds" signal — fall back to
+    # the generic wording rather than telling the caller to wait 0s. Cap the
+    # displayed value (1 day) so an absurd header can't produce a nonsense number.
+    if retry_after is not None and retry_after > 0:
+        display = int(min(retry_after, 86400))
         return (
             f"arXiv is rate limiting this IP (HTTP {status_code}). "
-            f"Server asks for {int(retry_after)}s before retrying."
+            f"Server asks for {display}s before retrying."
         )
     return (
         f"arXiv is rate limiting this IP (HTTP {status_code}). "
@@ -102,7 +112,17 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
                         response.status_code,
                         retry_after,
                     )
-                    await asyncio.sleep(retry_after)
+                    # Floor the wait at the configured interval so the retry is
+                    # itself paced: Retry-After of 0 / negative / a past HTTP-date
+                    # all parse to 0.0 and would otherwise fire an immediate
+                    # second request at a server already signalling distress.
+                    # (With pacing disabled the floor is 0 — request unchanged.)
+                    cooldown = max(retry_after, _arxiv_min_interval())
+                    # Publish the shared back-off BEFORE we sleep so sibling
+                    # coroutines/processes stop firing immediately, not only after
+                    # they each independently hit their own 429.
+                    record_arxiv_cooldown(cooldown)
+                    await asyncio.sleep(cooldown)
                     # Bump the pacer clock so sibling lanes back off too.
                     record_arxiv_request()
                     retry_response = await client.get(url, headers=ARXIV_HEADERS)
@@ -113,6 +133,9 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
                         logger.warning(
                             "arXiv still rate limited (%s) after retry — failing fast",
                             retry_response.status_code,
+                        )
+                        record_arxiv_cooldown(
+                            retry_after2 if retry_after2 is not None else 60.0
                         )
                         raise RuntimeError(
                             _rate_limit_message(
@@ -125,6 +148,7 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
                     "arXiv rate limited (%s) — backing off, not retrying",
                     response.status_code,
                 )
+                record_arxiv_cooldown(retry_after if retry_after is not None else 60.0)
                 raise RuntimeError(
                     _rate_limit_message(response.status_code, retry_after)
                 )
@@ -636,16 +660,20 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
         except arxiv.ArxivError as e:
             if "429" in str(e) or "rate" in str(e).lower() or "503" in str(e):
                 logger.warning(f"arXiv rate limited — not retrying: {e}")
+                # Publish a shared back-off (the arxiv lib exposes no header, so
+                # use the conservative default) before failing fast.
+                record_arxiv_cooldown(60.0)
                 raise RuntimeError(
                     "arXiv is rate limiting this IP. Wait at least 60s before "
                     "retrying — observed cooldowns can reach ~3 minutes under "
                     "parallel use."
                 )
             raise
-
-        # The library made 1..N of its own requests across the iteration; record
-        # so sibling lanes pace off the last one.
-        record_arxiv_request()
+        finally:
+            # The library made 1..N of its own requests across the iteration
+            # (even a partial or failed one hit the network); record so sibling
+            # lanes pace off the last one whether or not it succeeded.
+            record_arxiv_request()
 
         logger.info(f"Search completed: {len(results)} results returned")
         response_data = {"total_results": len(results), "papers": results}

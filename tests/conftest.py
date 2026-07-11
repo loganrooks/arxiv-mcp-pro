@@ -20,8 +20,10 @@ def _disable_arxiv_pacing(monkeypatch):
     from arxiv_mcp_server.tools import arxiv_pacing
 
     monkeypatch.setattr(arxiv_pacing.settings, "ARXIV_MIN_REQUEST_INTERVAL", 0.0)
-    # Keep the in-process clock from leaking between tests.
+    # Keep the in-process pacing state from leaking between tests.
     monkeypatch.setattr(arxiv_pacing, "_last_request_time", 0.0)
+    monkeypatch.setattr(arxiv_pacing, "_not_before", 0.0)
+    monkeypatch.setattr(arxiv_pacing, "_fail_open_warned", False)
 
 
 class MockAuthor:
