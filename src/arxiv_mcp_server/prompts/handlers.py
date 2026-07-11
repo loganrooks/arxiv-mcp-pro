@@ -101,14 +101,14 @@ async def get_prompt(
     elif name == "summarize_paper":
         content = (
             f"Summarize paper {paper_id}.\n\n"
-            "Use list_papers/download_paper/read_paper as needed before summarizing.\n\n"
+            "Use list_papers/download_paper/read_paper as needed before summarizing (read_paper caps large papers: while is_truncated is true, re-call with start=next_start so the summary covers the whole paper).\n\n"
             f"{SUMMARIZE_PAPER_PROMPT}"
         )
     elif name == "compare_papers":
         paper_ids = arguments.get("paper_ids", "")
         content = (
             f"Compare papers: {paper_ids}.\n\n"
-            "Use list_papers/download_paper/read_paper to gather full text for each paper.\n\n"
+            "Use list_papers/download_paper/read_paper to gather the full text of each paper — read_paper caps large papers, so while is_truncated is true, re-call with start=next_start until you have every chunk.\n\n"
             f"{COMPARE_PAPERS_PROMPT}"
         )
     else:
