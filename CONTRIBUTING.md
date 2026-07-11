@@ -13,9 +13,11 @@ source .venv/bin/activate
 uv pip install -e ".[test]"      # dev + test dependencies
 ```
 
-Install the git hooks (both the pre-commit and pre-push stages):
+Install the git hooks (both the pre-commit and pre-push stages). `pre-commit`
+itself is not part of the `[test]` extra, so install it first:
 
 ```bash
+uv pip install pre-commit
 pre-commit install --install-hooks -t pre-commit -t pre-push
 ```
 

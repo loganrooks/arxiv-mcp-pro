@@ -76,17 +76,20 @@ or run it with no install at all via `uvx`:
 # Install from PyPI
 pip install arxiv-mcp-pro
 
-# ...or run it directly, no install, with uv:
-uvx arxiv-mcp-pro --help
+# ...or skip the install and point your MCP client at uvx (see the
+# integration examples below — running `uvx arxiv-mcp-pro` by hand starts
+# the stdio server, which waits silently for an MCP client):
+uvx arxiv-mcp-pro
 
 # Add the [pdf] extra for older, PDF-only papers:
 pip install "arxiv-mcp-pro[pdf]"
 ```
 
-Verify the install:
+Verify the install (the server has no `--help` yet — it speaks MCP over
+stdio, so invoking it bare just waits for a client):
 
 ```bash
-arxiv-mcp-pro --help
+pip show arxiv-mcp-pro
 ```
 
 > **PDF fallback (older papers):** Most arXiv papers have an HTML version handled
