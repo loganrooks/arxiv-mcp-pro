@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     MAX_RESULTS: int = 50
     BATCH_SIZE: int = 20
     REQUEST_TIMEOUT: int = 60
+    # Default cap on paper characters returned by read_paper / download_paper
+    # when the caller omits `max_chars`. Uncapped whole-paper returns (~137k
+    # chars observed in the field) overflow MCP clients' per-tool-output limits
+    # and block the read path entirely; responses carry `is_truncated` /
+    # `next_start`, so capped reads are discoverable and pageable. An explicit
+    # `max_chars` always wins. `0` disables the default cap (legacy behavior:
+    # omitting max_chars returns full content).
+    CONTENT_DEFAULT_MAX_CHARS: int = 60000
     TRANSPORT: str = "stdio"
     HOST: str = "127.0.0.1"
     PORT: int = 8000

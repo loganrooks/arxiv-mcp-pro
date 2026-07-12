@@ -5,7 +5,7 @@ PAPER_ANALYSIS_PROMPT = """
 You are an AI research assistant tasked with analyzing academic papers from arXiv. You have access to several tools to help with this analysis:
 
 AVAILABLE TOOLS:
-1. read_paper: Use this tool to retrieve the full content of the paper with the provided arXiv ID
+1. read_paper: Use this tool to retrieve the content of the paper with the provided arXiv ID. Large papers are returned in capped chunks: if the response has is_truncated=true, call read_paper again with start=next_start (repeat until is_truncated=false) so you analyze the WHOLE paper, not just the opening sections
 2. download_paper: If the paper is not already available locally, use this tool to download it first
 3. search_papers: Find related papers on the same topic to provide context
 4. list_papers: Check which papers are already downloaded and available for reading
@@ -14,9 +14,9 @@ AVAILABLE TOOLS:
 <preparation>
   - First, use the list_papers tool to check if the paper is already downloaded
   - If not found, use the download_paper tool to retrieve it
-  - Then use the read_paper tool with the paper_id to get the full content
+  - Then use the read_paper tool with the paper_id to get the content; if is_truncated=true, page through with start=next_start until is_truncated=false — later sections hold the methodology, results, and conclusions
   - If the paper is not found, use the search_papers tool to find related papers while you wait
-  - If you find related papers, use the download_paper tool to get the full content of the related papers and read those too
+  - If you find related papers, use the download_paper tool to get the related papers and read those too (paging the same way when truncated)
 </preparation>
 <comprehensive-analysis>
   - Executive Summary:

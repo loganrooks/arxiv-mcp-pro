@@ -2,6 +2,10 @@
 
 from typing import Any
 
+from ..config import Settings
+
+settings = Settings()
+
 
 def _coerce_nonnegative_int(value: Any, default: int) -> int:
     """Return ``value`` as a non-negative integer, or ``default`` if absent."""
@@ -35,6 +39,12 @@ def paginate_content(content: str, arguments: dict[str, Any]) -> dict[str, Any]:
     content_length = len(content)
     start = min(_coerce_nonnegative_int(arguments.get("start"), 0), content_length)
     max_chars = _coerce_positive_int(arguments.get("max_chars"))
+    if max_chars is None:
+        # No explicit max_chars: apply the server's default cap (B12). Uncapped
+        # whole-paper defaults overflowed MCP clients' per-tool-output limits;
+        # is_truncated/next_start make the capped default pageable. A
+        # non-positive setting disables the cap (legacy full-content default).
+        max_chars = _coerce_positive_int(settings.CONTENT_DEFAULT_MAX_CHARS)
 
     end = (
         content_length if max_chars is None else min(content_length, start + max_chars)

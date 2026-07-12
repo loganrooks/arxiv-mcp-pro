@@ -21,7 +21,10 @@ read_tool = types.Tool(
     annotations=ToolAnnotations(readOnlyHint=True),
     description=(
         "Read the text content of a paper that was previously downloaded via download_paper. "
-        "Returns the paper in markdown format and supports start/max_chars pagination for large papers. "
+        "Returns the paper in markdown format with start/max_chars pagination. Large papers are "
+        "returned in capped chunks by default (60000 chars unless the server's "
+        "CONTENT_DEFAULT_MAX_CHARS overrides it) — check `is_truncated` "
+        "and follow `next_start` to page through the rest. "
         "Will fail with a clear error if the paper has not been downloaded yet — call download_paper first. "
         "Workflow: search_papers -> download_paper -> read_paper."
     ),
@@ -40,7 +43,7 @@ read_tool = types.Tool(
             "max_chars": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Maximum raw paper characters to return from start; omit for full content",
+                "description": "Maximum raw paper characters to return from start. When omitted, the server's default cap applies (CONTENT_DEFAULT_MAX_CHARS, default 60000; 0 disables). Pass an explicit value to override.",
             },
         },
         "required": ["paper_id"],
