@@ -159,6 +159,129 @@ async def test_record_arxiv_request_no_file_when_disabled(paced, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# pace_arxiv_request_sync (B20) — blocking counterpart for worker-thread callers
+#
+# The sync pacer shares the SAME in-process clock (_last_request_time), lock
+# file, and cooldown channel as the async pacer; these mirror the async tests
+# above using the sync entrypoint. Plain sync tests where possible (the sync
+# pacer blocks the calling thread); the interleaving test is async because it
+# also awaits pace_arxiv_request. _quiesce_interval_gate is defined below in the
+# cooldown section — module-level names resolve at call time, so forward use is
+# fine.
+# ---------------------------------------------------------------------------
+
+
+def test_sync_interval_zero_returns_immediately_no_file(paced, monkeypatch):
+    """interval=0 disables the sync pacer entirely: no wait, no lock file."""
+    _set_interval(monkeypatch, 0.0)
+
+    start = time.monotonic()
+    arxiv_pacing.pace_arxiv_request_sync()
+    elapsed = time.monotonic() - start
+
+    # Generous ceiling — the point is "no interval-sized wait", not sub-100ms
+    # precision on a loaded CI runner.
+    assert elapsed < 0.5
+    assert not (paced / "arxiv_api.lock").exists()
+
+
+def test_sync_second_sequential_call_is_delayed(paced, monkeypatch):
+    """Two sequential sync paces with a small interval: the second is delayed by
+    the cross-process gate (the lock-file mtime the first call left behind).
+    Mirrors test_second_sequential_call_is_delayed for the sync entrypoint."""
+    _set_interval(monkeypatch, 0.3)
+
+    arxiv_pacing.pace_arxiv_request_sync()  # first call primes the lock-file mtime
+
+    # Reset the in-process clock so the second call's delay comes purely from the
+    # cross-process lock-file mtime, not the in-process monotonic gate.
+    monkeypatch.setattr(arxiv_pacing, "_last_request_time", 0.0)
+
+    start = time.monotonic()
+    arxiv_pacing.pace_arxiv_request_sync()
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 0.25, f"second sync call not paced (elapsed={elapsed:.3f}s)"
+    assert (paced / "arxiv_api.lock").exists()
+
+
+def test_sync_record_cooldown_makes_pace_wait(paced, monkeypatch):
+    """record_arxiv_cooldown writes the cooldown file; a following sync pace with
+    a small interval sleeps until the cooldown passes. Mirrors
+    test_record_cooldown_makes_pace_wait for the sync entrypoint."""
+    _set_interval(monkeypatch, 0.3)
+    _quiesce_interval_gate(paced)
+
+    arxiv_pacing.record_arxiv_cooldown(0.4)
+    assert (paced / "arxiv_api.cooldown").exists()
+
+    start = time.monotonic()
+    arxiv_pacing.pace_arxiv_request_sync()
+    elapsed = time.monotonic() - start
+
+    assert (
+        elapsed >= 0.35
+    ), f"cooldown not honored by sync pacer (elapsed={elapsed:.3f}s)"
+
+
+@pytest.mark.asyncio
+async def test_sync_then_async_pace_off_one_clock(paced, monkeypatch):
+    """The sync and async lanes pace off ONE clock: after pace_arxiv_request_sync
+    advances the shared _last_request_time and bumps the lock-file mtime, an
+    immediately following ``await pace_arxiv_request`` is delayed by that shared
+    state. The interval gate is quiesced (old lock mtime) so the sync call itself
+    does not wait and the async delay is attributable to the shared clock."""
+    _set_interval(monkeypatch, 0.3)
+    _quiesce_interval_gate(paced)
+
+    lock_file = paced / "arxiv_api.lock"
+    pre_mtime = os.stat(str(lock_file)).st_mtime
+
+    arxiv_pacing.pace_arxiv_request_sync()
+
+    # The sync lane advanced BOTH shared channels: the in-process monotonic clock
+    # and the cross-process lock-file mtime.
+    assert arxiv_pacing._last_request_time > 0.0
+    assert os.stat(str(lock_file)).st_mtime > pre_mtime
+
+    start = time.monotonic()
+    await arxiv_pacing.pace_arxiv_request()
+    elapsed = time.monotonic() - start
+
+    assert (
+        elapsed >= 0.25
+    ), f"async pace not delayed by the sync lane's clock (elapsed={elapsed:.3f}s)"
+
+
+@pytest.mark.asyncio
+async def test_sync_then_async_share_inprocess_clock_even_without_flock(
+    paced, monkeypatch
+):
+    """MAJOR-1: the sync and async lanes share the SAME in-process clock even when
+    the cross-process file lock is fully failed-open. With _cross_process_gate
+    stubbed to a no-op the lock-file mtime channel is disabled, so the async
+    delay can ONLY come from the shared _last_request_time the sync lane set —
+    which pins that both lanes route their tail through the one in-process gate
+    (test_sync_then_async_pace_off_one_clock alone could pass via the mtime)."""
+    _set_interval(monkeypatch, 0.3)
+    _quiesce_interval_gate(paced)
+
+    arxiv_pacing.pace_arxiv_request_sync()
+
+    # Disable the cross-process (lock-file mtime) channel entirely: now the only
+    # remaining shared state is the in-process _last_request_time clock.
+    monkeypatch.setattr(arxiv_pacing, "_cross_process_gate", lambda interval: None)
+
+    start = time.monotonic()
+    await arxiv_pacing.pace_arxiv_request()
+    elapsed = time.monotonic() - start
+
+    assert (
+        elapsed >= 0.25
+    ), f"in-process clock not shared across lanes in fail-open (elapsed={elapsed:.3f}s)"
+
+
+# ---------------------------------------------------------------------------
 # Shared cooldown channel (C-1)
 # ---------------------------------------------------------------------------
 

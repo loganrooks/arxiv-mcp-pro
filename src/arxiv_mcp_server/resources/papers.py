@@ -8,6 +8,7 @@ import logging
 from pydantic import AnyUrl
 import mcp.types as types
 from ..config import Settings
+from ..tools.arxiv_pacing import pace_arxiv_request, record_arxiv_request
 
 logger = logging.getLogger("arxiv-mcp-pro")
 
@@ -42,8 +43,16 @@ class PaperManager:
             # listing/reading the local library works on a base/[influence] install.
             import pymupdf4llm
 
-            paper = next(self.client.results(arxiv.Search(id_list=[paper_id])))
-            paper.download_pdf(dirpath=self.storage_path, filename=paper_pdf_path)
+            # Pace the arXiv metadata call against sibling coroutines AND
+            # processes, and record after — even a failed attempt hit the
+            # network (B20; same convention as download.py's PDF path, where
+            # the PDF content stream itself is out of scope — B10).
+            await pace_arxiv_request()
+            try:
+                paper = next(self.client.results(arxiv.Search(id_list=[paper_id])))
+                paper.download_pdf(dirpath=self.storage_path, filename=paper_pdf_path)
+            finally:
+                record_arxiv_request()
             markdown = pymupdf4llm.to_markdown(paper_pdf_path, show_progress=False)
 
             async with aiofiles.open(paper_md_path, "w", encoding="utf-8") as f:
@@ -79,8 +88,16 @@ class PaperManager:
         resources = []
 
         for paper_id in paper_ids:
+            # One arXiv API call per locally stored paper — pace each iteration
+            # (B20). Under the default 3s interval a large library makes this
+            # slow; batching the ids into one id_list query is the real fix and
+            # is tracked separately (B22) — pacing must not wait on it.
+            await pace_arxiv_request()
             search = arxiv.Search(id_list=[paper_id])
-            papers = list(self.client.results(search))
+            try:
+                papers = list(self.client.results(search))
+            finally:
+                record_arxiv_request()
 
             if papers:
                 paper = papers[0]

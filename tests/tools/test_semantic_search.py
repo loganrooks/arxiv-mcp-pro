@@ -1,6 +1,8 @@
 """Tests for semantic search and reindex tools."""
 
+import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -376,3 +378,198 @@ async def test_reindex_uses_local_markdown_ids(
     payload = json.loads(response[0].text)
     assert payload["status"] == "success"
     assert set(indexed_ids) == {"2301.00001", "2301.00002"}
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_waits_for_running_reindex(
+    semantic_test_env, monkeypatch
+):
+    """A semantic_search issued while a reindex is running must block on the
+    shared _reindex_lock until the rebuild finishes, rather than reading a
+    just-cleared / partial index (codex P2 — reindex/read race).
+
+    The fake rebuild runs in a worker thread (handle_reindex offloads it via
+    asyncio.to_thread). It signals `started` (rebuild has entered, and
+    handle_reindex is holding the lock), then blocks on `release` — a
+    threading.Event because the block happens off the event loop.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fake_rebuild(clear_existing=True):
+        started.set()
+        # Hold the reindex lock (via handle_reindex) until the test releases us.
+        release.wait(timeout=5)
+        return {
+            "status": "success",
+            "indexed": 0,
+            "failed": [],
+            "total_local_papers": 0,
+        }
+
+    monkeypatch.setattr(semantic_module, "rebuild_index", _fake_rebuild)
+    # Keep the search path off the DB/model: deterministic embed + empty corpus.
+    monkeypatch.setattr(
+        semantic_module, "_embed_text", lambda text: np.zeros(3, dtype=np.float32)
+    )
+    monkeypatch.setattr(semantic_module, "_load_vectors", lambda *a, **k: [])
+
+    reindex_task = asyncio.create_task(semantic_module.handle_reindex({}))
+    # Wait until the rebuild is actually running inside the lock.
+    assert await asyncio.to_thread(started.wait, 5) is True
+
+    search_task = asyncio.create_task(
+        semantic_module.handle_semantic_search({"query": "x"})
+    )
+    # Give the search a chance to run; it must be parked on the reindex lock.
+    await asyncio.sleep(0.05)
+    assert search_task.done() is False
+
+    # Let the rebuild finish; the search should then acquire the lock and return.
+    release.set()
+    await reindex_task
+    response = await search_task
+
+    payload = json.loads(response[0].text)
+    assert payload["mode"] == "semantic_query"
+    assert payload["total_results"] == 0
+    assert payload["papers"] == []
+
+
+@pytest.mark.asyncio
+async def test_reindex_lock_held_until_worker_finishes_after_cancel(
+    semantic_test_env, monkeypatch
+):
+    """If handle_reindex is CANCELLED (client disconnect / timeout) while the
+    rebuild worker thread is still running, the lock must stay held until the
+    WORKER finishes — not be released when the cancelled coroutine unwinds.
+    Otherwise a semantic_search could acquire the lock and read a just-cleared /
+    partial index mid-rebuild (codex P2).
+
+    Cancelling `await asyncio.to_thread(rebuild_index, ...)` does not stop the
+    thread; the fix ties the release to the worker's done-callback, so a search
+    issued after the cancel must park on the lock until the worker returns.
+    """
+    # The module-global _reindex_lock binds to an event loop on its contended
+    # slow path. Any earlier lock-contending test (e.g. the sibling
+    # test_semantic_search_waits_for_running_reindex) leaves it bound to that
+    # test's now-closed loop; contending it again here on pytest-asyncio's fresh
+    # per-test loop would raise "bound to a different event loop". Reset it so
+    # _get_reindex_lock() mints a fresh lock on THIS loop (mirrors the fixture's
+    # `_model = None` reset). Purely a test-harness artifact — production runs a
+    # single long-lived loop, so the lock binds once.
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fake_rebuild(clear_existing=True):
+        started.set()
+        # Keep the worker (and thus the lock) alive past the coroutine cancel.
+        release.wait(timeout=5)
+        return {
+            "status": "success",
+            "indexed": 0,
+            "failed": [],
+            "total_local_papers": 0,
+        }
+
+    monkeypatch.setattr(semantic_module, "rebuild_index", _fake_rebuild)
+    # Keep the search path off the DB/model: deterministic embed + empty corpus.
+    monkeypatch.setattr(
+        semantic_module, "_embed_text", lambda text: np.zeros(3, dtype=np.float32)
+    )
+    monkeypatch.setattr(semantic_module, "_load_vectors", lambda *a, **k: [])
+
+    reindex_task = asyncio.create_task(semantic_module.handle_reindex({}))
+    # Wait until the rebuild worker is actually running (lock is held).
+    assert await asyncio.to_thread(started.wait, 5) is True
+
+    # Cancel the handler coroutine. The worker thread keeps running; the fix
+    # must keep the lock held until that worker completes.
+    reindex_task.cancel()
+    await asyncio.sleep(0.05)
+    assert reindex_task.cancelled() or reindex_task.done()
+
+    # A search issued now must park on the still-held lock — the cancelled
+    # handler must NOT have released it early. THIS is the assertion the fix
+    # protects; the plain `async with` form fails right here.
+    search_task = asyncio.create_task(
+        semantic_module.handle_semantic_search({"query": "x"})
+    )
+    await asyncio.sleep(0.05)
+    assert search_task.done() is False
+
+    # Let the worker finish; its done-callback releases the lock and the search
+    # then proceeds. Awaiting the search to completion also drains the worker
+    # (the release happens on the worker's completion), so no task leaks.
+    release.set()
+    response = await asyncio.wait_for(search_task, 5)
+
+    payload = json.loads(response[0].text)
+    assert payload["mode"] == "semantic_query"
+    assert payload["total_results"] == 0
+    assert payload["papers"] == []
+
+
+# ---------------------------------------------------------------------------
+# index_paper_by_id arXiv pacing wiring (B20)
+#
+# The metadata fetch is paced through the SYNC cross-process pacer and recorded
+# after (finally-path), using a fresh arxiv.Client() per call (thread-confined —
+# NOT the shared get_arxiv_client(), whose requests.Session must not cross
+# threads). pace_arxiv_request_sync / record_arxiv_request are patched on the
+# module namespace — the import style is `from .arxiv_pacing import
+# pace_arxiv_request_sync, record_arxiv_request`, so they live as
+# `semantic_module.<name>`; the client is patched via `semantic_module.arxiv.Client`.
+# ---------------------------------------------------------------------------
+
+
+def test_index_paper_by_id_paces_before_fetch_records_after(monkeypatch):
+    """B20: index_paper_by_id calls the sync pacer BEFORE the arXiv fetch and
+    record_arxiv_request AFTER, via a fresh per-call arxiv.Client()."""
+    events = []
+    monkeypatch.setattr(
+        semantic_module, "pace_arxiv_request_sync", lambda: events.append("pace")
+    )
+    monkeypatch.setattr(
+        semantic_module, "record_arxiv_request", lambda: events.append("record")
+    )
+    # Isolate the pacing wiring from the embedding/DB path.
+    monkeypatch.setattr(semantic_module, "index_paper_from_result", lambda paper: True)
+
+    mock_paper = object()
+
+    class _Client:
+        def results(self, search):
+            events.append("fetch")
+            return iter([mock_paper])
+
+    client = _Client()
+    monkeypatch.setattr(semantic_module.arxiv, "Client", lambda *a, **k: client)
+
+    assert semantic_module.index_paper_by_id("2401.00001") is True
+    # Paced before the fetch, recorded after — exact order.
+    assert events == ["pace", "fetch", "record"]
+
+
+def test_index_paper_by_id_records_even_when_fetch_raises(monkeypatch):
+    """B20 finally-path: a failed fetch still records so sibling lanes pace off
+    the same clock; the handler swallows the error and returns False."""
+    events = []
+    monkeypatch.setattr(
+        semantic_module, "pace_arxiv_request_sync", lambda: events.append("pace")
+    )
+    monkeypatch.setattr(
+        semantic_module, "record_arxiv_request", lambda: events.append("record")
+    )
+
+    class _Client:
+        def results(self, search):
+            events.append("fetch")
+            raise RuntimeError("arxiv unreachable")
+
+    monkeypatch.setattr(semantic_module.arxiv, "Client", lambda *a, **k: _Client())
+
+    assert semantic_module.index_paper_by_id("2401.00001") is False
+    assert events == ["pace", "fetch", "record"]

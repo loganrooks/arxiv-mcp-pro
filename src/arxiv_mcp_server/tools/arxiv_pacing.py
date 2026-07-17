@@ -33,7 +33,10 @@ Design constraints:
   * The asyncio event loop is never blocked: all file/lock work runs in a worker
     thread via :func:`asyncio.to_thread`.
   * **Fail-open.** The pacer must never break a request. Any error in the
-    cross-process path degrades to in-process pacing only; the lock acquisition
+    cross-process path degrades to in-process pacing only — and that in-process
+    gate is shared across the async and sync entry points (both route their
+    serialized tail through the one ``_sync_request_lock``), so async/sync
+    spacing holds even when the file lock is unavailable. The lock acquisition
     is bounded and, on timeout, the request proceeds without the lock.
 """
 
@@ -42,6 +45,7 @@ import errno
 import logging
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -63,6 +67,16 @@ _COOLDOWN_CAP = 120.0
 # search.py. Coordinates coroutines/threads within a single process.
 _last_request_time: float = 0.0
 _request_lock = asyncio.Lock()
+
+# The single in-process gate for BOTH pacing lanes. A threading.Lock (not the
+# asyncio _request_lock) because it must be acquirable from a plain worker
+# thread: the async pacer routes its serialized tail through it via
+# asyncio.to_thread(_locked_pace_tail, ...), and the sync pacer takes it
+# directly. Because both lanes converge on this one lock, the in-process
+# monotonic gate is atomic across the async and sync lanes — so async/sync
+# serialization holds even in the fail-open (no-flock) regime; the flock in
+# _cross_process_gate remains the cross-PROCESS gate layered on top of it.
+_sync_request_lock = threading.Lock()
 
 # In-process cooldown deadline (monotonic). Mirrors the cross-process cooldown
 # file so same-process sibling coroutines back off without a file read.
@@ -367,21 +381,71 @@ async def _cooldown_remaining() -> float:
     return min(remaining, _COOLDOWN_CAP)
 
 
+def _locked_pace_tail(interval: float) -> None:
+    """Serialized pace tail shared by the async lane (via ``asyncio.to_thread``)
+    and the sync lane (directly): hold ``_sync_request_lock``, then apply the
+    in-process monotonic gate, the cross-process gate, and the clock bump.
+
+    ``_sync_request_lock`` makes the in-process gate atomic across BOTH lanes, so
+    in-process pacing holds even when the cross-process file lock is unavailable
+    (fail-open) — this closes the cross-lane fail-open gap. Without a shared
+    in-process lock, one async + one sync caller could otherwise each do an
+    unsynchronized read-sleep-write of ``_last_request_time`` and fire with zero
+    spacing whenever the flock degraded (unwritable dir / ENOLCK / lock timeout).
+
+    Blocking by design (it sleeps); never call on the event-loop thread.
+
+    Deadlock analysis: the async lane holds ``_request_lock`` (asyncio) and
+    acquires ``_sync_request_lock`` in a worker thread; the sync lane holds
+    ``_sync_request_lock`` and never touches ``_request_lock`` — no cycle. Every
+    hold is bounded (cooldown cap + one interval + the flock acquire timeout).
+    """
+    global _last_request_time
+    with _sync_request_lock:
+        # Re-check the cooldown after acquiring the lock (async pacer's FIX-B):
+        # a cooldown published while this thread queued would otherwise be
+        # missed. Bounded cumulative wait (FIX-4) for liveness.
+        slept_total = 0.0
+        for _ in range(_RECHECK_MAX_ITERS):
+            remaining = _cooldown_remaining_sync()
+            if remaining <= 0:
+                break
+            remaining = min(remaining, _COOLDOWN_CAP - slept_total)
+            if remaining <= 0:
+                _warn_fail_open_once(
+                    "cooldown wait",
+                    OSError("cumulative in-lock cooldown wait hit the cap"),
+                )
+                break
+            time.sleep(remaining)
+            slept_total += remaining
+
+        elapsed = time.monotonic() - _last_request_time
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+
+        try:
+            _cross_process_gate(interval)
+        except OSError as exc:  # fail-open: in-process pacing already applied
+            _warn_fail_open_once("cross-process gate", exc)
+
+        _last_request_time = time.monotonic()
+
+
 async def pace_arxiv_request() -> None:
     """Pace an outbound arXiv API request across coroutines and processes.
 
     Call immediately before an arXiv API request. With the interval at 0 all
     pacing is disabled (no waiting, no lock file). Otherwise: honor the shared
-    cooldown, then acquire the in-process lock, re-check the cooldown, apply the
-    in-process monotonic gate, and run the cross-process gate off the event loop.
-    Fail-open — any cross-process error leaves the in-process pacing in force and
-    never raises.
+    cooldown, then acquire the async in-process lock, re-check the cooldown, and
+    run the shared serialized pace tail (in-process monotonic gate + cross-process
+    gate) off the event loop via :func:`_locked_pace_tail`. Fail-open — any
+    cross-process error leaves the in-process pacing in force and never raises.
     """
     interval = _min_interval()
     if interval <= 0:
         return
 
-    global _last_request_time
     # Fast-path cooldown check (pre-lock) so a lane backs off before even queuing
     # for the interval lock. Honored BEFORE the locked gate so a cooldown is
     # respected even while another lane holds the lock.
@@ -413,18 +477,44 @@ async def pace_arxiv_request() -> None:
             await asyncio.sleep(remaining)
             slept_total += remaining
 
-        # In-process gate (cheap, always correct within this process).
-        elapsed = time.monotonic() - _last_request_time
-        if elapsed < interval:
-            await asyncio.sleep(interval - elapsed)
+        # Serialized pace tail (in-process monotonic gate + cross-process gate +
+        # clock bump), shared with the sync lane and run off the event loop. It
+        # holds _sync_request_lock, so the in-process gate is atomic across BOTH
+        # lanes even in the fail-open (no-flock) regime.
+        await asyncio.to_thread(_locked_pace_tail, interval)
 
-        # Cross-process gate (blocking file/lock work, off the loop).
-        try:
-            await asyncio.to_thread(_cross_process_gate, interval)
-        except OSError as exc:  # fail-open: in-process pacing already applied
-            _warn_fail_open_once("cross-process gate", exc)
 
-        _last_request_time = time.monotonic()
+def pace_arxiv_request_sync() -> None:
+    """Pace an outbound arXiv API request from synchronous / worker-thread code.
+
+    The blocking counterpart of :func:`pace_arxiv_request` for call sites that
+    are not coroutines (e.g. ``index_paper_by_id`` running under
+    ``asyncio.to_thread``). Never call it on the event-loop thread — it sleeps.
+
+    Same contract: with the interval at 0 all pacing is disabled; otherwise
+    honor the shared cooldown, then run the serialized pace tail
+    (:func:`_locked_pace_tail`) under the shared ``_sync_request_lock``.
+    """
+    interval = _min_interval()
+    if interval <= 0:
+        return
+
+    # Fast-path cooldown check (pre-lock), mirroring the async pacer.
+    remaining = _cooldown_remaining_sync()
+    if remaining > 0:
+        time.sleep(remaining)
+
+    _locked_pace_tail(interval)
+
+
+def _cooldown_remaining_sync() -> float:
+    """Blocking counterpart of :func:`_cooldown_remaining` (same max/cap)."""
+    remaining = _cooldown_remaining_inprocess()
+    try:
+        remaining = max(remaining, _cooldown_remaining_file())
+    except OSError as exc:  # fail-open: cooldown is best-effort
+        _warn_fail_open_once("cooldown read", exc)
+    return min(remaining, _COOLDOWN_CAP)
 
 
 def record_arxiv_request() -> None:
