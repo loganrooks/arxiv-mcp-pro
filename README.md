@@ -254,6 +254,8 @@ result = await call_tool("search_papers", {
 
 Supported categories include `cs.AI`, `cs.LG`, `cs.CL`, `cs.CV`, `cs.NE`, `stat.ML`, `math.OC`, `quant-ph`, `eess.SP`, and more. See tool description for the full list.
 
+The query, category, and date clauses are joined with an explicit `AND`, so `categories` is a **strict** filter (a bare space is not `AND` on the arXiv API — it ranks loosely, closer to `OR`). The response reports `total_results` (the corpus-wide count of papers matching the query, from the feed's `opensearch:totalResults`) and `returned` (the number of papers in this page). Prefer `sort_by: "relevance"` (the default) for topical search; `sort_by: "date"` returns a recency firehose only weakly filtered by the query.
+
 ### 2. Paper Download
 Download a paper by its arXiv ID. Tries HTML first, falls back to PDF. Stores the paper locally for `read_paper` and `semantic_search`. The response includes `content_length`, `returned_chars`, `next_start`, and `is_truncated` so clients can safely page through very large papers without mistaking client-side output caps for failed downloads.
 

@@ -32,6 +32,14 @@ driven by multi-agent field use.
   listing — are paced too (see the B20 Fixed entry below).
 
 ### Changed
+- **`search_papers` reports the real corpus-wide match count** (B16). `total_results`
+  is now the arXiv feed's `opensearch:totalResults` — the total number of papers matching
+  the query — instead of `len(page)` (which was always ≤ `max_results` and misleading). A
+  new `returned` field carries the page size (the count `total_results` used to report).
+  `search_papers` also now runs through a **single code path**: both date-filtered and
+  plain queries route through the raw-HTTP helper (the arxiv-package branch, which
+  space-joined its clauses, is gone), so behaviour no longer diverges by whether a date
+  filter is present.
 - **`read_paper` / `download_paper` now cap the default content return** at
   `CONTENT_DEFAULT_MAX_CHARS` (60000 chars) when `max_chars` is omitted (B12).
   Uncapped whole-paper defaults (~137k chars observed) overflowed MCP clients'
@@ -54,6 +62,15 @@ driven by multi-agent field use.
   `pip install` shrinks from ~77 MB / 46 packages to ~53 MB / 40 packages.
 
 ### Fixed
+- **`search_papers`' category filter is now a strict `AND`** (B16). Non-date queries
+  previously went through the arxiv Python package, which joined the query group and the
+  category group with a bare space — and a space is *not* `AND` on the arXiv API (it ranks
+  loosely, closer to `OR`), so the `categories` filter was advisory rather than strict and
+  off-topic results leaked in (e.g. `survey` + `cs.HC OR cs.CY` returned astronomy
+  sky-surveys). All queries now route through the raw-HTTP helper, which joins clauses with
+  an explicit `AND`. Every outbound GET inside the rate-limited helper now also records the
+  request against the cross-process pacer clock (previously only the pre-request pace was
+  recorded).
 - **The remaining arXiv call sites now pace through the cross-process limiter** (B20). The
   semantic-index metadata fetches — `PaperManager.store_paper` / `list_resources` and
   `index_paper_by_id` (used by the `reindex` loop, `semantic_search`'s on-demand source-paper

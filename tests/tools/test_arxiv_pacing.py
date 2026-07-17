@@ -841,8 +841,10 @@ async def test_429_no_header_publishes_default_cooldown(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_search_paces_once(mock_client, monkeypatch):
-    """search_papers (client path) calls pace_arxiv_request exactly once."""
+async def test_handle_search_paces_once(monkeypatch):
+    """search_papers routes through _raw_arxiv_search → _rate_limited_get, which
+    calls pace_arxiv_request exactly once for a single successful GET (B16 unified
+    the old arxiv-package path onto the raw-HTTP path)."""
     calls = []
 
     async def _recording_pace():
@@ -851,10 +853,26 @@ async def test_handle_search_paces_once(mock_client, monkeypatch):
     monkeypatch.setattr(
         "arxiv_mcp_server.tools.search.pace_arxiv_request", _recording_pace
     )
+    # Neutralise the recorder so this test never touches the real storage dir.
     monkeypatch.setattr(
-        "arxiv_mcp_server.tools.search.get_arxiv_client",
-        lambda *a, **k: mock_client,
+        "arxiv_mcp_server.tools.search.record_arxiv_request", MagicMock()
     )
+
+    # Stub the httpx client so the (real) _rate_limited_get returns canned XML.
+    mock_response = MagicMock()
+    mock_response.text = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom" '
+        'xmlns:arxiv="http://arxiv.org/schemas/atom"></feed>'
+    )
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=mock_client))
 
     result = await handle_search({"query": "test", "max_results": 1})
 
