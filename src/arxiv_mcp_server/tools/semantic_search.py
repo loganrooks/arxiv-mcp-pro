@@ -16,7 +16,7 @@ import arxiv
 import mcp.types as types
 from mcp.types import ToolAnnotations
 
-from ..config import Settings, get_arxiv_client
+from ..config import Settings
 from .arxiv_pacing import pace_arxiv_request_sync, record_arxiv_request
 from .list_papers import is_valid_arxiv_id
 
@@ -37,6 +37,23 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 INDEX_DB_NAME = "semantic_index.db"
 
 _model: Optional[Any] = None
+
+# Guards a running `reindex` against concurrent `semantic_search` reads. With
+# `clear_existing=True`, `rebuild_index` commits `DELETE FROM semantic_index`
+# then slowly re-indexes off the event loop (B20); without this lock a search
+# landing mid-rebuild would read a just-cleared / partial corpus. Lazy + module
+# level so it can rebind across event loops in tests, mirroring
+# download.py's `_get_index_semaphore` (asyncio primitives only bind to a loop
+# on their contended slow path, so uncontended callers are loop-agnostic).
+_reindex_lock: Optional[asyncio.Lock] = None
+
+
+def _get_reindex_lock() -> asyncio.Lock:
+    """Return the module-level reindex lock, creating it lazily."""
+    global _reindex_lock
+    if _reindex_lock is None:
+        _reindex_lock = asyncio.Lock()
+    return _reindex_lock
 
 
 @dataclass
@@ -236,12 +253,13 @@ def index_paper_by_id(paper_id: str) -> bool:
     Blocking (network + embedding) — run it off the event loop
     (``asyncio.to_thread``); the async handlers in this module and download.py
     do. Pacing: the metadata fetch goes through the sync cross-process pacer
-    (B20). The shared client replaces a fresh ``arxiv.Client()`` per call;
-    pacing is governed by the sync cross-process pacer, not by any
-    client-internal delay.
+    (B20) — pacing is the pacer's job, not any client-internal delay. The
+    ``arxiv.Client()`` is created per call because this function runs in worker
+    threads, so no ``requests.Session`` is shared across threads; the shared
+    ``get_arxiv_client()`` instance is used by the foreground paths.
     """
     try:
-        client = get_arxiv_client()
+        client = arxiv.Client()
         pace_arxiv_request_sync()
         try:
             paper = next(client.results(arxiv.Search(id_list=[paper_id])))
@@ -408,7 +426,10 @@ async def handle_reindex(arguments: Dict[str, Any]) -> List[types.TextContent]:
         # Off the event loop: rebuild_index makes one paced arXiv call per
         # local paper (N × the pacing interval under B20) plus embedding work.
         # Run inline, that would freeze every other tool for minutes.
-        result = await asyncio.to_thread(rebuild_index, clear_existing)
+        # Hold _reindex_lock so a concurrent semantic_search waits for the
+        # rebuild rather than reading a just-cleared / partially-rebuilt index.
+        async with _get_reindex_lock():
+            result = await asyncio.to_thread(rebuild_index, clear_existing)
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     except Exception as exc:
         logger.error("Reindex failed: %s", exc)
@@ -448,35 +469,43 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
                 )
             ]
 
-        if paper_id:
-            query_vector = _get_indexed_paper_vector(paper_id)
-            if query_vector is None:
-                logger.info(
-                    "Paper %s not indexed yet, attempting to fetch and index", paper_id
-                )
-                # Off the event loop: blocking network fetch, paced (B20).
-                if not await asyncio.to_thread(index_paper_by_id, paper_id):
-                    return [
-                        types.TextContent(
-                            type="text",
-                            text=f"Error: Could not index source paper {paper_id}.",
-                        )
-                    ]
+        # Serialize the read/rank against a running reindex: searches wait for a
+        # running rebuild rather than reading a just-cleared index (pre-B20, the
+        # inline rebuild blocked the loop and serialized these de facto; the lock
+        # restores those observable semantics while keeping OTHER tools
+        # responsive). Holding it across the query-mode _embed_text too is
+        # harmless and keeps the critical section a single block.
+        async with _get_reindex_lock():
+            if paper_id:
                 query_vector = _get_indexed_paper_vector(paper_id)
+                if query_vector is None:
+                    logger.info(
+                        "Paper %s not indexed yet, attempting to fetch and index",
+                        paper_id,
+                    )
+                    # Off the event loop: blocking network fetch, paced (B20).
+                    if not await asyncio.to_thread(index_paper_by_id, paper_id):
+                        return [
+                            types.TextContent(
+                                type="text",
+                                text=f"Error: Could not index source paper {paper_id}.",
+                            )
+                        ]
+                    query_vector = _get_indexed_paper_vector(paper_id)
 
-            candidates = _load_vectors(exclude_paper_id=paper_id)
-            mode = "similar_to_paper"
-            query_payload = paper_id
-        else:
-            query_vector = _embed_text(query)
-            candidates = _load_vectors()
-            mode = "semantic_query"
-            query_payload = query
+                candidates = _load_vectors(exclude_paper_id=paper_id)
+                mode = "similar_to_paper"
+                query_payload = paper_id
+            else:
+                query_vector = _embed_text(query)
+                candidates = _load_vectors()
+                mode = "semantic_query"
+                query_payload = query
 
-        ranked = _rank_by_similarity(
-            query_vector, candidates, max_results=max_results, offset=offset
-        )
-        total_available = len(candidates)
+            ranked = _rank_by_similarity(
+                query_vector, candidates, max_results=max_results, offset=offset
+            )
+            total_available = len(candidates)
 
         papers = []
         for paper in ranked:

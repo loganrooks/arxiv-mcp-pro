@@ -28,9 +28,8 @@ driven by multi-agent field use.
   knob (default `3`s; `0` disables all pacing including the lock/cooldown files). Fail-open:
   any pacer error degrades to in-process pacing and never breaks a request. See the README
   "Parallel / multi-agent use" note; multiple machines behind one IP remain uncoordinated.
-  *Not yet paced (tracked follow-up):* the semantic-index metadata fetches —
-  `download_paper`'s deferred background re-index, `semantic_search`'s on-demand fetch of a
-  missing source paper, and the `reindex` loop (each uses a fresh `arxiv.Client()`).
+  The remaining call sites — the semantic-index metadata fetches and local resource
+  listing — are paced too (see the B20 Fixed entry below).
 
 ### Changed
 - **`read_paper` / `download_paper` now cap the default content return** at
@@ -55,6 +54,18 @@ driven by multi-agent field use.
   `pip install` shrinks from ~77 MB / 46 packages to ~53 MB / 40 packages.
 
 ### Fixed
+- **The remaining arXiv call sites now pace through the cross-process limiter** (B20). The
+  semantic-index metadata fetches — `PaperManager.store_paper` / `list_resources` and
+  `index_paper_by_id` (used by the `reindex` loop, `semantic_search`'s on-demand source-paper
+  fetch, and `download_paper`'s background re-index) — previously bypassed the pacer with a
+  fresh, unpaced `arxiv.Client()` and could burst past the ≈1-request/3s limit under
+  parallel/multi-agent use. They now route through the shared pacer via a new synchronous
+  entry point (`pace_arxiv_request_sync`) for the worker-thread callers, so a fleet sharing a
+  storage dir stays under the limit on every arXiv path.
+- `reindex` and `semantic_search`'s missing-source indexing now run off the event loop
+  (`asyncio.to_thread`), so their newly-paced, one-request-per-paper loops no longer freeze
+  every other tool; and `semantic_search` now serializes behind a running `reindex` (a shared
+  in-process lock) instead of reading a just-cleared index mid-rebuild (B20).
 - `search_papers` now documents which timestamp `date_from`/`date_to` bind to: arXiv's
   `submittedDate`, the original (v1) submission time — which can differ from the arXiv-ID
   prefix month and the latest-version date on cross-listed/revised papers, so strict
