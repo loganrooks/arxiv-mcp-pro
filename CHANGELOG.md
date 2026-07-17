@@ -80,6 +80,11 @@ driven by multi-agent field use.
   otherwise fail fast with an honest, actionable message (naming the server's requested
   delay, or noting observed cooldowns can reach ~3 minutes under parallel use) instead of
   the previous hardcoded "wait 60 seconds" (B17).
+- The Semantic Scholar request pacer now clamps the computed wait itself, not just the
+  configured interval — float round-up in the schedule arithmetic could push a single
+  pacing sleep a few ULPs past the 30s bound, which surfaced as a timing-dependent CI
+  test flake (`assert 30.00000000000003 <= 30.0`) and technically violated the pacer's
+  bounded-sleep guarantee (B21).
 
 ## [0.7.0] - 2026-06-27
 
