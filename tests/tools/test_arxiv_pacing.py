@@ -253,6 +253,34 @@ async def test_sync_then_async_pace_off_one_clock(paced, monkeypatch):
     ), f"async pace not delayed by the sync lane's clock (elapsed={elapsed:.3f}s)"
 
 
+@pytest.mark.asyncio
+async def test_sync_then_async_share_inprocess_clock_even_without_flock(
+    paced, monkeypatch
+):
+    """MAJOR-1: the sync and async lanes share the SAME in-process clock even when
+    the cross-process file lock is fully failed-open. With _cross_process_gate
+    stubbed to a no-op the lock-file mtime channel is disabled, so the async
+    delay can ONLY come from the shared _last_request_time the sync lane set —
+    which pins that both lanes route their tail through the one in-process gate
+    (test_sync_then_async_pace_off_one_clock alone could pass via the mtime)."""
+    _set_interval(monkeypatch, 0.3)
+    _quiesce_interval_gate(paced)
+
+    arxiv_pacing.pace_arxiv_request_sync()
+
+    # Disable the cross-process (lock-file mtime) channel entirely: now the only
+    # remaining shared state is the in-process _last_request_time clock.
+    monkeypatch.setattr(arxiv_pacing, "_cross_process_gate", lambda interval: None)
+
+    start = time.monotonic()
+    await arxiv_pacing.pace_arxiv_request()
+    elapsed = time.monotonic() - start
+
+    assert (
+        elapsed >= 0.25
+    ), f"in-process clock not shared across lanes in fail-open (elapsed={elapsed:.3f}s)"
+
+
 # ---------------------------------------------------------------------------
 # Shared cooldown channel (C-1)
 # ---------------------------------------------------------------------------

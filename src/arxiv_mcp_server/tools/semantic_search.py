@@ -236,8 +236,9 @@ def index_paper_by_id(paper_id: str) -> bool:
     Blocking (network + embedding) — run it off the event loop
     (``asyncio.to_thread``); the async handlers in this module and download.py
     do. Pacing: the metadata fetch goes through the sync cross-process pacer
-    (B20). The shared client replaces a fresh ``arxiv.Client()`` per call,
-    which defeated even the library's own in-client delay between calls.
+    (B20). The shared client replaces a fresh ``arxiv.Client()`` per call;
+    pacing is governed by the sync cross-process pacer, not by any
+    client-internal delay.
     """
     try:
         client = get_arxiv_client()
