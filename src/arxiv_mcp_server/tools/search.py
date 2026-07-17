@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from dateutil import parser
 import mcp.types as types
 from mcp.types import ToolAnnotations
@@ -296,10 +296,19 @@ async def _raw_arxiv_search(
         clauses.append(f"({_encode_query_text(query)})")
         readable.append(f"({query})")
 
-    # Add category filtering. Each category value is percent-encoded too (defence
-    # in depth — categories are already grammar-validated upstream), while the
-    # ``cat:`` prefix and the ``+OR+`` separator stay literal.
+    # Add category filtering. This is the SECURITY backstop for callers that reach
+    # the helper directly without going through handle_search's _validate_categories
+    # (e.g. check_alerts replaying saved-topic categories): every category must pass
+    # the strict token grammar before it is interpolated into the URL, so a value
+    # carrying whitespace, a boolean operator, a wildcard, or a URL delimiter is
+    # rejected here (raising BEFORE any network call) rather than smuggled onto the
+    # wire. handle_search still pre-validates for a friendlier early error + prefix
+    # warning; this is the last line of defence. Each value is also percent-encoded
+    # (defence in depth), while the ``cat:`` prefix and ``+OR+`` separator stay literal.
     if categories:
+        for cat in categories:
+            if not _CATEGORY_TOKEN.match(cat):
+                raise ValueError(f"Invalid category: {cat!r}")
         cat_group = "+OR+".join(f"cat:{_encode_query_text(cat)}" for cat in categories)
         clauses.append(f"({cat_group})")
         readable.append("(" + " OR ".join(f"cat:{cat}" for cat in categories) + ")")
@@ -391,8 +400,28 @@ def _parse_arxiv_atom_response(
             if id_elem is None or id_elem.text is None:
                 continue
 
+            id_text = id_elem.text.strip()
+
+            # arXiv reports API errors as an HTTP-200 Atom feed whose single entry
+            # has an id under /api/errors, title "Error", and the error text in
+            # <summary> (opensearch:totalResults is 1, so this would otherwise look
+            # like a genuine 1-paper result and callers would surface a bogus
+            # paper). Detect it by the id PATH — robust to http/https and any
+            # fragment — and raise so callers treat it as a failure: handle_search
+            # returns it as an "Error: ..." message, check_alerts records it as the
+            # topic's per-topic error. The deleted arxiv-package path raised on
+            # these; this restores that behaviour after unification.
+            if urlparse(id_text).path.rstrip("/").endswith("/api/errors"):
+                summary_elem = entry.find("atom:summary", ARXIV_NS)
+                detail = (
+                    summary_elem.text.strip().replace("\n", " ")
+                    if summary_elem is not None and summary_elem.text
+                    else "unknown error"
+                )
+                raise ValueError(f"arXiv API error: {detail}")
+
             # ID format: http://arxiv.org/abs/XXXX.XXXXX or http://arxiv.org/abs/category/XXXXXXX
-            paper_id = id_elem.text.split("/abs/")[-1]
+            paper_id = id_text.split("/abs/")[-1]
             # Strip only a TERMINAL version suffix (v1, v2, ...). A blunt
             # split("v") corrupts old-style archive ids whose name contains a
             # 'v' (e.g. solv-int/9501001v1 -> "sol"); anchor to the end instead.

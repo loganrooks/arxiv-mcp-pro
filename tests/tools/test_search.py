@@ -58,6 +58,25 @@ def _atom_feed(
     </feed>"""
 
 
+def _error_feed(
+    summary="Invalid query string: '( )'", id_url="https://arxiv.org/api/errors"
+):
+    """A canned arXiv API-error feed: HTTP-200 Atom whose single entry lives under
+    ``/api/errors`` (opensearch:totalResults=1), with the error text in <summary>.
+    This is how arXiv signals a bad query — NOT a 4xx/5xx status."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom"
+          xmlns:arxiv="http://arxiv.org/schemas/atom"
+          xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+        <opensearch:totalResults>1</opensearch:totalResults>
+        <entry>
+            <id>{id_url}</id>
+            <title>Error</title>
+            <summary>{summary}</summary>
+        </entry>
+    </feed>"""
+
+
 def _stub_httpx(monkeypatch, xml_text):
     """Patch ``httpx.AsyncClient`` so ``_raw_arxiv_search``'s GET returns canned
     Atom XML. Returns the mock client so a test can read the outgoing URL from
@@ -420,6 +439,55 @@ def test_parse_arxiv_atom_response_version_stripping(raw_id, expected_short):
     assert len(results) == 1
     assert results[0]["id"] == expected_short
     assert results[0]["resource_uri"] == f"arxiv://{expected_short}"
+
+
+# ---------------------------------------------------------------------------
+# B16 fix-round 2: arXiv API errors arrive as HTTP-200 /api/errors feeds, and
+# saved-topic categories must not bypass the grammar backstop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "id_url",
+    [
+        "https://arxiv.org/api/errors",
+        "http://arxiv.org/api/errors",
+        "http://arxiv.org/api/errors#f",
+        "https://arxiv.org/api/errors/",
+    ],
+)
+def test_parse_arxiv_atom_response_error_feed_raises(id_url):
+    """B16 P2-1: an /api/errors entry (http/https, with/without fragment or
+    trailing slash) is surfaced as a ValueError carrying the summary — not a
+    bogus paper."""
+    with pytest.raises(ValueError) as exc:
+        _parse_arxiv_atom_response(_error_feed(id_url=id_url))
+    assert "arXiv API error" in str(exc.value)
+    assert "Invalid query string" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_handle_search_error_feed_returns_error(monkeypatch):
+    """B16 P2-1 (a): a canned arXiv error feed makes handle_search return an
+    `Error:` message containing the summary text, NOT a papers payload."""
+    _stub_httpx(monkeypatch, _error_feed())
+    result = await handle_search({"query": "( )", "max_results": 5})
+
+    text = result[0].text
+    assert text.startswith("Error:")
+    assert "Invalid query string" in text
+    assert '"papers"' not in text  # no results payload was emitted
+
+
+@pytest.mark.asyncio
+async def test_raw_arxiv_search_rejects_bad_category_before_network(monkeypatch):
+    """B16 P2-2 (c): a malformed category raises ValueError from _raw_arxiv_search
+    BEFORE any network call — the httpx stub GET is never hit."""
+    mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
+    with pytest.raises(ValueError) as exc:
+        await _raw_arxiv_search(query="x", categories=["cs.AI OR all:*"])
+    assert "Invalid category" in str(exc.value)
+    assert mock_client.get.await_count == 0
 
 
 @pytest.mark.asyncio

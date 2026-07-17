@@ -93,6 +93,18 @@ driven by multi-agent field use.
   (B16). The short-id parser stripped from the first `v` rather than a terminal version
   suffix, so `solv-int/9501001v1` collapsed to `sol`; it now strips only a trailing `vN`
   (`solv-int/9501001v1` → `solv-int/9501001`, `2401.12345v2` → `2401.12345`).
+- **`search_papers` / `check_alerts` now surface arXiv API errors instead of a bogus
+  result** (B16). arXiv reports a bad query as an HTTP-200 Atom feed with a single
+  `/api/errors` entry (and `opensearch:totalResults` of 1), which the unified raw-HTTP
+  parser treated as a real 1-paper result; it now detects that entry and raises with the
+  feed's error text, so `search_papers` returns an `Error:` message and `check_alerts`
+  records it as that topic's per-topic error (restoring the behaviour the deleted
+  arxiv-package path had).
+- **Saved watch-topic categories can no longer bypass category validation** (B16).
+  `watch_topic` now validates `categories` at save time (rejecting a malformed value before
+  it is persisted), and `_raw_arxiv_search` enforces the strict category-token grammar as a
+  backstop, so a malformed/injection value in a stored watch (e.g. `cs.AI OR all:*`) is
+  rejected before any request is built rather than interpolated into the arXiv URL.
 - **The remaining arXiv call sites now pace through the cross-process limiter** (B20). The
   semantic-index metadata fetches — `PaperManager.store_paper` / `list_resources` and
   `index_paper_by_id` (used by the `reindex` loop, `semantic_search`'s on-demand source-paper
