@@ -47,6 +47,12 @@ driven by multi-agent field use.
   and `Run Tests` workflows, and pip dependency caching to `CI` and `Lint` (the `Run
   Tests` matrix installs via `uv`, so pip caching does not apply — a uv cache is a
   follow-up); removed the dead `master` branch triggers and leftover template comments.
+- **Slimmer install**: dropped `aiohttp`, `python-dotenv`, `anyio`, and `sse-starlette`
+  from the runtime dependencies (none were imported anywhere; `anyio`/`sse-starlette`
+  still arrive via `mcp` and dotenv support via `pydantic-settings`, so behavior is
+  unchanged) and pinned `arxiv>=2.1,<3` — arxiv 4.x pulls in lxml (~20 MB compiled)
+  and had never been what the lockfile and test suite ran against. A clean
+  `pip install` shrinks from ~77 MB / 46 packages to ~53 MB / 40 packages.
 
 ### Fixed
 - `search_papers` now documents which timestamp `date_from`/`date_to` bind to: arXiv's
