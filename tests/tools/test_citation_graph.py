@@ -1646,6 +1646,34 @@ async def test_pace_request_clamps_huge_interval(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pace_request_wait_clamped_even_if_schedule_drifts(monkeypatch):
+    """The *wait* is clamped, not just the configured interval: even if
+    `_next_request_time` sits pathologically far ahead (schedule drift, or the
+    float round-up where `now + 30.0` lands a few ULPs above 30 — the CI flake
+    `assert 30.00000000000003 <= 30.0`), a single pacing sleep never exceeds
+    MAX_PACE_INTERVAL."""
+    monkeypatch.setattr(
+        citation_graph.settings, "SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL", 1.0
+    )
+    citation_graph._pace_lock = None
+    citation_graph._pace_loop = None
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(citation_graph.asyncio, "sleep", sleep_mock)
+    citation_graph._next_request_time = time.monotonic() + 10_000.0
+    try:
+        await citation_graph._pace_request()
+    finally:
+        citation_graph._next_request_time = 0.0
+        citation_graph._pace_lock = None
+        citation_graph._pace_loop = None
+
+    sleep_mock.assert_awaited_once()
+    # Exactly the clamp: min(~9999.9, 30.0) is 30.0 bit-for-bit, so == proves
+    # the clamp engaged (<= would also pass if the pacer regressed to sleep 0).
+    assert sleep_mock.await_args.args[0] == citation_graph.MAX_PACE_INTERVAL
+
+
+@pytest.mark.asyncio
 async def test_pace_request_non_finite_interval_is_noop(monkeypatch):
     """A non-finite interval (inf / nan) disables pacing instead of hanging."""
     sleep_mock = AsyncMock()

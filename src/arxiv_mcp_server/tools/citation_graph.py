@@ -114,7 +114,13 @@ async def _pace_request() -> None:
     global _next_request_time
     async with _get_pace_lock():
         now = time.monotonic()
-        wait = _next_request_time - now
+        # Clamp the wait itself, not just the interval: `now + interval` can
+        # round up in float arithmetic, so a back-to-back call may compute a
+        # wait a few ULPs above MAX_PACE_INTERVAL (observed in CI:
+        # 30.00000000000003). Should any future writer ever move
+        # _next_request_time far ahead, this bounds the sleep — and the
+        # schedule is then rewritten to now + interval below, not preserved.
+        wait = min(_next_request_time - now, MAX_PACE_INTERVAL)
         if wait > 0:
             await asyncio.sleep(wait)
             now = time.monotonic()
