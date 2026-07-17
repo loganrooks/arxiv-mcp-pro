@@ -8,6 +8,7 @@ directly and returns canned Atom XML.
 
 import pytest
 import json
+import httpx
 from unittest.mock import patch, MagicMock, AsyncMock
 from arxiv_mcp_server.tools import handle_search
 from arxiv_mcp_server.tools.search import (
@@ -81,6 +82,17 @@ def _outgoing_url(mock_client):
     return mock_client.get.call_args[0][0]
 
 
+def _wire(url):
+    """Parse an outgoing arXiv URL the WIRE way — i.e. the way the arXiv server
+    would, via ``httpx.Request`` (no network I/O). Returns ``(search_query value,
+    params dict)`` with every value percent-DECODED, so a reserved character that
+    was properly encoded on the wire (e.g. ``%23``) shows up INSIDE the
+    ``search_query`` value, whereas a leaked one would truncate/split the params.
+    """
+    parsed = httpx.Request("GET", url).url
+    return parsed.params.get("search_query"), dict(parsed.params)
+
+
 # ---------------------------------------------------------------------------
 # handle_search behaviour (all via the unified raw-HTTP path)
 # ---------------------------------------------------------------------------
@@ -151,29 +163,114 @@ async def test_search_with_invalid_dates():
 async def test_categories_anded_with_query_in_url(monkeypatch):
     """B16 (5a): a non-date query + categories joins the query group and the
     category group with an explicit +AND+, so the category filter is strict — a
-    bare space is NOT AND on the arXiv API."""
+    bare space is NOT AND on the arXiv API. Asserted on the WIRE view."""
     mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
     await handle_search(
         {"query": "survey", "categories": ["cs.HC", "cs.CY"], "max_results": 5}
     )
 
     url = _outgoing_url(mock_client)
-    assert "search_query=" in url
+    # The literal +AND+ separator is on the wire (proves the AND token, not a bare space).
     assert "+AND+" in url
-    # Groups are AND-joined; parens are left literal by the encode replace-chain.
-    assert "(survey)+AND+(cat:cs.HC+OR+cat:cs.CY)" in url
+    # And the server-decoded query is a strict AND of the two groups.
+    sq, _params = _wire(url)
+    assert sq == "(survey) AND (cat:cs.HC OR cat:cs.CY)"
 
 
 @pytest.mark.asyncio
 async def test_quoted_phrase_preserved_in_url(monkeypatch):
-    """B16 (5b): a quoted phrase survives the encode replace-chain — quotes are
-    preserved and the interior space becomes '+' (accepted identically by the live
-    API, measured 2026-07-17)."""
+    """B16 (5b): a quoted phrase survives encoding — the colon and quotes stay
+    intact and the interior space decodes back to a space, so the arXiv server
+    still sees a field-scoped phrase query. Asserted on the WIRE view."""
     mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
     await handle_search({"query": 'ti:"transformer architecture"', "max_results": 5})
 
+    sq, _params = _wire(_outgoing_url(mock_client))
+    assert sq == '(ti:"transformer architecture")'
+
+
+# ---------------------------------------------------------------------------
+# B16 fix-round: search_query encoding must not under-encode reserved chars.
+# Every assertion is on the WIRE view (httpx.Request(...).url.params), not the
+# pre-parse URL string — a reserved char that leaked would truncate/split the
+# params rather than appear inside the search_query value.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query, needle",
+    [
+        ("C#", "C#"),  # '#' would otherwise start the URL fragment
+        ("R&D", "R&D"),  # '&' would otherwise split off a spurious param
+        ("50%", "50%"),  # '%' is the escape char itself
+        ("C++", "C++"),  # a literal '+' must survive as '+', not become spaces
+        ("Schrödinger", "Schrödinger"),  # non-ASCII must be percent-encoded
+    ],
+)
+async def test_reserved_chars_encoded_on_the_wire(monkeypatch, query, needle):
+    """B16 fix (1a): reserved / non-ASCII characters in query text are
+    percent-encoded so they land INSIDE the search_query value on the wire, and
+    the following parameters are not lost."""
+    mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
+    await _raw_arxiv_search(query=query, max_results=7)
+
     url = _outgoing_url(mock_client)
-    assert 'ti:"transformer+architecture"' in url
+    sq, params = _wire(url)
+    assert needle in sq, f"{needle!r} not preserved inside search_query: {sq!r}"
+    # The parameters after the query must survive (nothing truncated/split).
+    assert params.get("max_results") == "7"
+    assert params.get("sortBy") == "relevance"
+
+
+@pytest.mark.asyncio
+async def test_max_results_survives_hash_query(monkeypatch):
+    """B16 fix (1e): a '#' in the query no longer truncates the URL — the
+    max_results / sortBy parameters still reach arXiv."""
+    mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
+    await handle_search({"query": "C#", "categories": ["cs.PL"], "max_results": 9})
+
+    url = _outgoing_url(mock_client)
+    sq, params = _wire(url)
+    assert "C#" in sq
+    assert "cat:cs.PL" in sq  # the category clause was not dropped
+    assert params.get("max_results") == "9"
+    assert params.get("sortBy") == "relevance"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("A AND B", "(A AND B)"),
+        ("A OR B", "(A OR B)"),
+        ("A ANDNOT B", "(A ANDNOT B)"),
+    ],
+)
+async def test_boolean_operators_preserved(monkeypatch, query, expected):
+    """B16 fix (1c): the boolean operators AND / OR / ANDNOT survive encoding as
+    tokens (server-decoded)."""
+    mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
+    await _raw_arxiv_search(query=query, max_results=5)
+
+    sq, _params = _wire(_outgoing_url(mock_client))
+    assert sq == expected
+
+
+@pytest.mark.asyncio
+async def test_date_filter_plus_to_literal_on_wire(monkeypatch):
+    """B16 fix (1d): the internally-built date filter keeps a literal +TO+ on the
+    wire (never %2BTO%2B), and the server decodes it to a TO range."""
+    mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
+    await _raw_arxiv_search(
+        query="llm", date_from="2023-01-01", date_to="2023-12-31", max_results=5
+    )
+
+    url = _outgoing_url(mock_client)
+    assert "+TO+" in url
+    assert "%2BTO%2B" not in url
+    sq, _params = _wire(url)
+    assert "submittedDate:[202301010000 TO 202312312359]" in sq
 
 
 @pytest.mark.asyncio
@@ -207,10 +304,12 @@ async def test_total_results_falls_back_to_returned(monkeypatch):
 async def test_date_and_non_date_share_one_path(monkeypatch):
     """B16 (5e): a plain query and a date-filtered query both route through the raw
     httpx path; the deleted arxiv-package client (get_arxiv_client) is never run."""
-    import arxiv_mcp_server.config as config
-
+    # Sentinel in search's OWN namespace, where the deleted code bound the symbol
+    # (raising=False: the name no longer exists there after B16, so create it).
     sentinel = MagicMock(side_effect=AssertionError("arxiv-package path must not run"))
-    monkeypatch.setattr(config, "get_arxiv_client", sentinel)
+    monkeypatch.setattr(
+        "arxiv_mcp_server.tools.search.get_arxiv_client", sentinel, raising=False
+    )
 
     mock_client = _stub_httpx(monkeypatch, _atom_feed(entries=1))
 
@@ -227,10 +326,30 @@ def test_validate_categories():
     # Valid categories
     assert _validate_categories(["cs.AI", "cs.LG"])
     assert _validate_categories(["math.CO", "physics.gen-ph"])
+    # Hyphenated archive prefixes with no dotted subcategory.
+    assert _validate_categories(["astro-ph", "cond-mat", "hep-th"])
 
-    # Invalid categories
+    # Unknown archive prefix → rejected.
     assert not _validate_categories(["invalid.category"])
     assert not _validate_categories(["cs.AI", "invalid.test"])
+
+
+def test_validate_categories_unknown_subcategory_allowed():
+    """B16 fix (3): a well-formed but unknown SUBcategory keeps prefix-level
+    semantics (arXiv tolerates unknown subcategories) — allowed."""
+    assert _validate_categories(["cs.NOTREAL"])
+    assert _validate_categories(["cs.AI", "math.MADEUP"])
+
+
+def test_validate_categories_rejects_injection():
+    """B16 fix (3): a category value carrying whitespace, a boolean operator, a
+    wildcard, or a URL delimiter is rejected before it can be interpolated into
+    the request URL."""
+    assert not _validate_categories(["cs.AI OR all:*"])
+    assert not _validate_categories(["cs.AI&max_results=1000"])
+    assert not _validate_categories(["cs AI"])
+    assert not _validate_categories(["cs.AI#frag"])
+    assert not _validate_categories(["cat:cs.AI"])  # a bare colon/prefix smuggle
 
 
 def test_parse_arxiv_atom_response():
@@ -270,6 +389,37 @@ def test_parse_arxiv_atom_response_total_results():
     results, total = _parse_arxiv_atom_response(xml_with_total)
     assert total == 4148
     assert len(results) == 2
+
+
+@pytest.mark.parametrize(
+    "raw_id, expected_short",
+    [
+        # 'v' inside an old-style archive NAME must not be treated as a version.
+        ("solv-int/9501001v1", "solv-int/9501001"),
+        ("hep-th/9901001v3", "hep-th/9901001"),
+        ("2401.12345v2", "2401.12345"),
+        # No version suffix passes through unchanged.
+        ("2401.12345", "2401.12345"),
+        ("solv-int/9501001", "solv-int/9501001"),
+    ],
+)
+def test_parse_arxiv_atom_response_version_stripping(raw_id, expected_short):
+    """B16 fix (2): only a TERMINAL vN suffix is stripped from the paper id — a
+    literal 'v' inside an old-style archive name is left intact."""
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+        <entry>
+            <id>http://arxiv.org/abs/{raw_id}</id>
+            <title>T</title>
+            <summary>S</summary>
+            <published>2023-01-01T00:00:00Z</published>
+            <author><name>A</name></author>
+        </entry>
+    </feed>"""
+    results, _total = _parse_arxiv_atom_response(xml)
+    assert len(results) == 1
+    assert results[0]["id"] == expected_short
+    assert results[0]["resource_uri"] == f"arxiv://{expected_short}"
 
 
 @pytest.mark.asyncio
@@ -433,7 +583,7 @@ async def test_search_sort_by_date(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_search_no_query_optimization(mock_client):
+async def test_search_no_query_optimization():
     """Test that queries are not automatically modified."""
     from arxiv_mcp_server.tools.search import _optimize_query
 

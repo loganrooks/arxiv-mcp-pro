@@ -590,6 +590,81 @@ def _resp(status_code, headers=None):
     return r
 
 
+def _stub_recorder(monkeypatch):
+    """Neutralise pace / cooldown / sleep (no real storage, no waiting) and return
+    a MagicMock standing in for ``record_arxiv_request`` so a test can assert how
+    many network attempts ``_rate_limited_get`` recorded."""
+    rec = MagicMock()
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.record_arxiv_request", rec)
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.pace_arxiv_request", AsyncMock())
+    monkeypatch.setattr(
+        "arxiv_mcp_server.tools.search.record_arxiv_cooldown", MagicMock()
+    )
+
+    async def _no_sleep(secs):
+        pass
+
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.asyncio.sleep", _no_sleep)
+    return rec
+
+
+# The record-after contract (B16 fix 4): _rate_limited_get must record exactly one
+# request per attempted GET (record-even-on-failure), so sibling lanes pace off
+# every attempt. These assert the boundary call_count — reverting either
+# record_arxiv_request finally-block turns one of them red.
+
+
+@pytest.mark.asyncio
+async def test_record_after_success_once(monkeypatch):
+    """One successful GET → one record."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(return_value=_resp(200))
+
+    await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_record_after_timeout_then_success_twice(monkeypatch):
+    """Timeout then a successful retry → one record per GET = 2."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=[httpx.TimeoutException("boom"), _resp(200)])
+
+    await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_after_429_then_success_twice(monkeypatch):
+    """429 (short Retry-After) then a successful retry → 2 records."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=[_resp(429, {"Retry-After": "1"}), _resp(200)])
+
+    await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_after_429_then_timeout_twice(monkeypatch):
+    """429 then a timed-out retry still records both attempts (2) and fails fast."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(
+        side_effect=[_resp(429, {"Retry-After": "1"}), httpx.TimeoutException("boom")]
+    )
+
+    with pytest.raises(RuntimeError):
+        await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 2
+
+
 @pytest.mark.asyncio
 async def test_retry_after_short_retries_once_and_succeeds(monkeypatch):
     """429 with a short Retry-After is slept out, then retried once → 200."""
