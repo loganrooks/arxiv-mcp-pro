@@ -376,3 +376,64 @@ async def test_reindex_uses_local_markdown_ids(
     payload = json.loads(response[0].text)
     assert payload["status"] == "success"
     assert set(indexed_ids) == {"2301.00001", "2301.00002"}
+
+
+# ---------------------------------------------------------------------------
+# index_paper_by_id arXiv pacing wiring (B20)
+#
+# The metadata fetch is paced through the SYNC cross-process pacer and recorded
+# after (finally-path), using the shared client from get_arxiv_client (not a
+# fresh arxiv.Client() per call). All three are patched on the module namespace
+# — the import style is `from .arxiv_pacing import pace_arxiv_request_sync,
+# record_arxiv_request`, so they live as `semantic_module.<name>`.
+# ---------------------------------------------------------------------------
+
+
+def test_index_paper_by_id_paces_before_fetch_records_after(monkeypatch):
+    """B20: index_paper_by_id calls the sync pacer BEFORE the arXiv fetch and
+    record_arxiv_request AFTER, via the shared get_arxiv_client client."""
+    events = []
+    monkeypatch.setattr(
+        semantic_module, "pace_arxiv_request_sync", lambda: events.append("pace")
+    )
+    monkeypatch.setattr(
+        semantic_module, "record_arxiv_request", lambda: events.append("record")
+    )
+    # Isolate the pacing wiring from the embedding/DB path.
+    monkeypatch.setattr(semantic_module, "index_paper_from_result", lambda paper: True)
+
+    mock_paper = object()
+
+    class _Client:
+        def results(self, search):
+            events.append("fetch")
+            return iter([mock_paper])
+
+    client = _Client()
+    monkeypatch.setattr(semantic_module, "get_arxiv_client", lambda *a, **k: client)
+
+    assert semantic_module.index_paper_by_id("2401.00001") is True
+    # Paced before the fetch, recorded after — exact order.
+    assert events == ["pace", "fetch", "record"]
+
+
+def test_index_paper_by_id_records_even_when_fetch_raises(monkeypatch):
+    """B20 finally-path: a failed fetch still records so sibling lanes pace off
+    the same clock; the handler swallows the error and returns False."""
+    events = []
+    monkeypatch.setattr(
+        semantic_module, "pace_arxiv_request_sync", lambda: events.append("pace")
+    )
+    monkeypatch.setattr(
+        semantic_module, "record_arxiv_request", lambda: events.append("record")
+    )
+
+    class _Client:
+        def results(self, search):
+            events.append("fetch")
+            raise RuntimeError("arxiv unreachable")
+
+    monkeypatch.setattr(semantic_module, "get_arxiv_client", lambda *a, **k: _Client())
+
+    assert semantic_module.index_paper_by_id("2401.00001") is False
+    assert events == ["pace", "fetch", "record"]

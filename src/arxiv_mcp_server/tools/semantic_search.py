@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -15,7 +16,8 @@ import arxiv
 import mcp.types as types
 from mcp.types import ToolAnnotations
 
-from ..config import Settings
+from ..config import Settings, get_arxiv_client
+from .arxiv_pacing import pace_arxiv_request_sync, record_arxiv_request
 from .list_papers import is_valid_arxiv_id
 
 try:
@@ -229,10 +231,23 @@ def _upsert_index_record(
 
 
 def index_paper_by_id(paper_id: str) -> bool:
-    """Fetch arXiv metadata by ID and add/update it in the semantic index."""
+    """Fetch arXiv metadata by ID and add/update it in the semantic index.
+
+    Blocking (network + embedding) — run it off the event loop
+    (``asyncio.to_thread``); the async handlers in this module and download.py
+    do. Pacing: the metadata fetch goes through the sync cross-process pacer
+    (B20). The shared client replaces a fresh ``arxiv.Client()`` per call,
+    which defeated even the library's own in-client delay between calls.
+    """
     try:
-        client = arxiv.Client()
-        paper = next(client.results(arxiv.Search(id_list=[paper_id])))
+        client = get_arxiv_client()
+        pace_arxiv_request_sync()
+        try:
+            paper = next(client.results(arxiv.Search(id_list=[paper_id])))
+        finally:
+            # Even a failed attempt hit the network; record it so sibling
+            # lanes pace off the same clock.
+            record_arxiv_request()
     except StopIteration:
         logger.warning("Could not index paper %s: not found on arXiv", paper_id)
         return False
@@ -389,7 +404,10 @@ async def handle_reindex(arguments: Dict[str, Any]) -> List[types.TextContent]:
     """Handle reindex tool calls."""
     try:
         clear_existing = bool(arguments.get("clear_existing", True))
-        result = rebuild_index(clear_existing=clear_existing)
+        # Off the event loop: rebuild_index makes one paced arXiv call per
+        # local paper (N × the pacing interval under B20) plus embedding work.
+        # Run inline, that would freeze every other tool for minutes.
+        result = await asyncio.to_thread(rebuild_index, clear_existing)
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     except Exception as exc:
         logger.error("Reindex failed: %s", exc)
@@ -435,7 +453,8 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
                 logger.info(
                     "Paper %s not indexed yet, attempting to fetch and index", paper_id
                 )
-                if not index_paper_by_id(paper_id):
+                # Off the event loop: blocking network fetch, paced (B20).
+                if not await asyncio.to_thread(index_paper_by_id, paper_id):
                     return [
                         types.TextContent(
                             type="text",

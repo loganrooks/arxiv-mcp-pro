@@ -42,6 +42,7 @@ import errno
 import logging
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -63,6 +64,15 @@ _COOLDOWN_CAP = 120.0
 # search.py. Coordinates coroutines/threads within a single process.
 _last_request_time: float = 0.0
 _request_lock = asyncio.Lock()
+
+# Sync-path in-process gate (pace_arxiv_request_sync). A separate lock because
+# an asyncio.Lock cannot be awaited from a plain worker thread. The two locks do
+# NOT mutually exclude each other — but both paths converge on the flock in
+# _cross_process_gate, and two fds within one process DO contend under
+# flock/msvcrt.locking, so real serialization holds even between the async and
+# sync lanes of the same process; the shared _last_request_time clock (a float
+# store, atomic under the GIL) keeps their in-process gates roughly honest.
+_sync_request_lock = threading.Lock()
 
 # In-process cooldown deadline (monotonic). Mirrors the cross-process cooldown
 # file so same-process sibling coroutines back off without a file read.
@@ -425,6 +435,69 @@ async def pace_arxiv_request() -> None:
             _warn_fail_open_once("cross-process gate", exc)
 
         _last_request_time = time.monotonic()
+
+
+def pace_arxiv_request_sync() -> None:
+    """Pace an outbound arXiv API request from synchronous / worker-thread code.
+
+    The blocking counterpart of :func:`pace_arxiv_request` for call sites that
+    are not coroutines (e.g. ``index_paper_by_id`` running under
+    ``asyncio.to_thread``). Never call it on the event-loop thread — it sleeps.
+
+    Same contract: with the interval at 0 all pacing is disabled; otherwise
+    honor the shared cooldown, take the sync in-process lock, re-check the
+    cooldown, apply the in-process monotonic gate, run the cross-process gate,
+    and fail open on any cross-process error.
+    """
+    interval = _min_interval()
+    if interval <= 0:
+        return
+
+    global _last_request_time
+    # Fast-path cooldown check (pre-lock), mirroring the async pacer.
+    remaining = _cooldown_remaining_sync()
+    if remaining > 0:
+        time.sleep(remaining)
+
+    with _sync_request_lock:
+        # Re-check the cooldown after acquiring the lock (async pacer's FIX-B):
+        # a cooldown published while this thread queued would otherwise be
+        # missed. Bounded cumulative wait (FIX-4) for liveness.
+        slept_total = 0.0
+        for _ in range(_RECHECK_MAX_ITERS):
+            remaining = _cooldown_remaining_sync()
+            if remaining <= 0:
+                break
+            remaining = min(remaining, _COOLDOWN_CAP - slept_total)
+            if remaining <= 0:
+                _warn_fail_open_once(
+                    "cooldown wait",
+                    OSError("cumulative in-lock cooldown wait hit the cap"),
+                )
+                break
+            time.sleep(remaining)
+            slept_total += remaining
+
+        elapsed = time.monotonic() - _last_request_time
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+
+        try:
+            _cross_process_gate(interval)
+        except OSError as exc:  # fail-open: in-process pacing already applied
+            _warn_fail_open_once("cross-process gate", exc)
+
+        _last_request_time = time.monotonic()
+
+
+def _cooldown_remaining_sync() -> float:
+    """Blocking counterpart of :func:`_cooldown_remaining` (same max/cap)."""
+    remaining = _cooldown_remaining_inprocess()
+    try:
+        remaining = max(remaining, _cooldown_remaining_file())
+    except OSError as exc:  # fail-open: cooldown is best-effort
+        _warn_fail_open_once("cooldown read", exc)
+    return min(remaining, _COOLDOWN_CAP)
 
 
 def record_arxiv_request() -> None:
