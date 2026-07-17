@@ -428,8 +428,29 @@ async def handle_reindex(arguments: Dict[str, Any]) -> List[types.TextContent]:
         # Run inline, that would freeze every other tool for minutes.
         # Hold _reindex_lock so a concurrent semantic_search waits for the
         # rebuild rather than reading a just-cleared / partially-rebuilt index.
-        async with _get_reindex_lock():
-            result = await asyncio.to_thread(rebuild_index, clear_existing)
+        #
+        # Tie the lock's release to the WORKER's completion, not this
+        # coroutine's. Cancelling `await asyncio.to_thread(...)` (client
+        # disconnect / request timeout) does NOT stop the worker thread — a
+        # plain `async with` would exit and release the lock while the thread
+        # is still mid-`DELETE FROM semantic_index` + repopulate, letting a
+        # semantic_search acquire the lock and read the cleared/partial corpus
+        # (codex P2). Acquire manually; release only from the worker's
+        # done-callback (runs on the loop, fires exactly once). asyncio.shield
+        # keeps the worker uncancelled; on cancellation CancelledError
+        # propagates out of the handler (BaseException on 3.11 — NOT caught by
+        # `except Exception` below), while the thread runs on holding the lock.
+        lock = _get_reindex_lock()
+        await lock.acquire()
+        try:
+            worker = asyncio.ensure_future(
+                asyncio.to_thread(rebuild_index, clear_existing)
+            )
+        except BaseException:
+            lock.release()
+            raise
+        worker.add_done_callback(lambda _t: lock.release())
+        result = await asyncio.shield(worker)
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     except Exception as exc:
         logger.error("Reindex failed: %s", exc)
@@ -474,7 +495,11 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
         # inline rebuild blocked the loop and serialized these de facto; the lock
         # restores those observable semantics while keeping OTHER tools
         # responsive). Holding it across the query-mode _embed_text too is
-        # harmless and keeps the critical section a single block.
+        # harmless and keeps the critical section a single block. Unlike
+        # reindex, a plain `async with` is safe here: a cancelled search
+        # releases the lock with no orphan worker mutating shared state — the
+        # only write on this path is a single index_paper_by_id upsert, never a
+        # clear+rebuild, so an early release cannot expose a cleared index.
         async with _get_reindex_lock():
             if paper_id:
                 query_vector = _get_indexed_paper_vector(paper_id)

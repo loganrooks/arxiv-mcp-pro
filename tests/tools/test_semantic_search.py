@@ -436,6 +436,82 @@ async def test_semantic_search_waits_for_running_reindex(
     assert payload["papers"] == []
 
 
+@pytest.mark.asyncio
+async def test_reindex_lock_held_until_worker_finishes_after_cancel(
+    semantic_test_env, monkeypatch
+):
+    """If handle_reindex is CANCELLED (client disconnect / timeout) while the
+    rebuild worker thread is still running, the lock must stay held until the
+    WORKER finishes — not be released when the cancelled coroutine unwinds.
+    Otherwise a semantic_search could acquire the lock and read a just-cleared /
+    partial index mid-rebuild (codex P2).
+
+    Cancelling `await asyncio.to_thread(rebuild_index, ...)` does not stop the
+    thread; the fix ties the release to the worker's done-callback, so a search
+    issued after the cancel must park on the lock until the worker returns.
+    """
+    # The module-global _reindex_lock binds to an event loop on its contended
+    # slow path. Any earlier lock-contending test (e.g. the sibling
+    # test_semantic_search_waits_for_running_reindex) leaves it bound to that
+    # test's now-closed loop; contending it again here on pytest-asyncio's fresh
+    # per-test loop would raise "bound to a different event loop". Reset it so
+    # _get_reindex_lock() mints a fresh lock on THIS loop (mirrors the fixture's
+    # `_model = None` reset). Purely a test-harness artifact — production runs a
+    # single long-lived loop, so the lock binds once.
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fake_rebuild(clear_existing=True):
+        started.set()
+        # Keep the worker (and thus the lock) alive past the coroutine cancel.
+        release.wait(timeout=5)
+        return {
+            "status": "success",
+            "indexed": 0,
+            "failed": [],
+            "total_local_papers": 0,
+        }
+
+    monkeypatch.setattr(semantic_module, "rebuild_index", _fake_rebuild)
+    # Keep the search path off the DB/model: deterministic embed + empty corpus.
+    monkeypatch.setattr(
+        semantic_module, "_embed_text", lambda text: np.zeros(3, dtype=np.float32)
+    )
+    monkeypatch.setattr(semantic_module, "_load_vectors", lambda *a, **k: [])
+
+    reindex_task = asyncio.create_task(semantic_module.handle_reindex({}))
+    # Wait until the rebuild worker is actually running (lock is held).
+    assert await asyncio.to_thread(started.wait, 5) is True
+
+    # Cancel the handler coroutine. The worker thread keeps running; the fix
+    # must keep the lock held until that worker completes.
+    reindex_task.cancel()
+    await asyncio.sleep(0.05)
+    assert reindex_task.cancelled() or reindex_task.done()
+
+    # A search issued now must park on the still-held lock — the cancelled
+    # handler must NOT have released it early. THIS is the assertion the fix
+    # protects; the plain `async with` form fails right here.
+    search_task = asyncio.create_task(
+        semantic_module.handle_semantic_search({"query": "x"})
+    )
+    await asyncio.sleep(0.05)
+    assert search_task.done() is False
+
+    # Let the worker finish; its done-callback releases the lock and the search
+    # then proceeds. Awaiting the search to completion also drains the worker
+    # (the release happens on the worker's completion), so no task leaks.
+    release.set()
+    response = await asyncio.wait_for(search_task, 5)
+
+    payload = json.loads(response[0].text)
+    assert payload["mode"] == "semantic_query"
+    assert payload["total_results"] == 0
+    assert payload["papers"] == []
+
+
 # ---------------------------------------------------------------------------
 # index_paper_by_id arXiv pacing wiring (B20)
 #
