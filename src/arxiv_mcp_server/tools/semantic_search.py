@@ -180,8 +180,8 @@ def _dependency_error() -> Optional[str]:
         return (
             "Pro feature dependency missing. Install the lightweight model2vec "
             'backend with `pip install "arxiv-mcp-pro[pro]"`, or the '
-            "sentence-transformers backend (exact parity with the pre-0.9 "
-            'embedding model) with `pip install "arxiv-mcp-pro[pro-st]"` '
+            "sentence-transformers backend (exact parity with the previous "
+            'default, all-MiniLM-L6-v2) with `pip install "arxiv-mcp-pro[pro-st]"` '
             '(from a source checkout: `uv pip install -e ".[pro]"` or '
             '`uv pip install -e ".[pro-st]"`).'
         )
@@ -309,7 +309,13 @@ def _get_model() -> Any:
             # `normalize: false`, which would make our dot-product ranking stop
             # being cosine similarity. Pinning the kwarg makes every model2vec
             # model cosine-safe regardless of its config.
-            _model = StaticModel.from_pretrained(name, normalize=True)
+            # force_download=False (R3): model2vec's from_pretrained DEFAULTS to
+            # force_download=True, which re-downloads from the HF hub on every
+            # fresh process even when the model is already cached. Pin it False so
+            # a cached model loads offline / without a redundant network fetch.
+            _model = StaticModel.from_pretrained(
+                name, normalize=True, force_download=False
+            )
         else:  # pragma: no cover - callers gate on _dependency_error first
             raise RuntimeError("No embedding backend available")
         _model_backend = backend
@@ -382,15 +388,20 @@ def _index_compat_error(query_vector: Optional[Any] = None) -> Optional[str]:
     if sample is None:
         return None
 
+    stored_model = _stored_index_identity(meta.get("embedding_model"), True)
+    current_model = _current_identity()
+
+    # R4: name BOTH identities so a user whose backend silently flipped (e.g. an
+    # unrelated `pip install` pulled in sentence-transformers, which auto-wins
+    # over model2vec) can see the cause, not just "incompatible".
     reindex_msg = (
-        "The local semantic index was built with a different embedding model "
-        "than the one now active, so its stored vectors are incompatible. Run "
-        "the `reindex` tool (clear_existing=true) to rebuild the index with the "
-        "current model."
+        f"The local semantic index was built by a different embedding model "
+        f"(index: {stored_model}; active: {current_model}), so its stored "
+        "vectors are incompatible. Run the `reindex` tool (clear_existing=true) "
+        "to rebuild the index with the current model."
     )
 
-    stored_model = _stored_index_identity(meta.get("embedding_model"), True)
-    if stored_model is not None and stored_model != _current_identity():
+    if stored_model is not None and stored_model != current_model:
         return reindex_msg
 
     if query_vector is not None:
@@ -445,15 +456,14 @@ def _upsert_index_record(
         sample = conn.execute(
             "SELECT embedding_dim FROM semantic_index LIMIT 1"
         ).fetchone()
-        meta_row = conn.execute(
-            "SELECT value FROM index_meta WHERE key = 'embedding_model'"
-        ).fetchone()
+        meta = {
+            row["key"]: row["value"]
+            for row in conn.execute("SELECT key, value FROM index_meta").fetchall()
+        }
 
         if sample is not None:
             stored_dim = int(sample["embedding_dim"])
-            stored_identity = _stored_index_identity(
-                meta_row["value"] if meta_row is not None else None, True
-            )
+            stored_identity = _stored_index_identity(meta.get("embedding_model"), True)
             # F2: refuse on a model-identity mismatch (even at the SAME dimension —
             # two different models share an embedding-space name only by accident)
             # AND on a dimension mismatch (defence in depth; also the only signal
@@ -509,18 +519,25 @@ def _upsert_index_record(
             ),
         )
         # Stamp which model produced these vectors (B23) so a later search can
-        # detect a model switch and refuse rather than mis-rank. The embedding
-        # just computed is authoritative for both the model identity and the dim.
-        conn.execute(
-            "INSERT INTO index_meta (key, value) VALUES ('embedding_model', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (current_identity,),
-        )
-        conn.execute(
-            "INSERT INTO index_meta (key, value) VALUES ('embedding_dim', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(new_dim),),
-        )
+        # detect a model switch and refuse rather than mis-rank. R8: only write a
+        # meta row when its value actually changes — on the steady-state path
+        # (re-indexing under the same model) both rows already match, so this
+        # skips 2 redundant writes per upsert. The embedding_model row is what the
+        # guards compare; the embedding_dim row is INFORMATIONAL/diagnostic only —
+        # the compat and write guards read the actual per-row `embedding_dim` from
+        # semantic_index, not this meta value (rejected fable F3).
+        if meta.get("embedding_model") != current_identity:
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES ('embedding_model', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (current_identity,),
+            )
+        if meta.get("embedding_dim") != str(new_dim):
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES ('embedding_dim', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(new_dim),),
+            )
         conn.execute("COMMIT")
 
     return True
@@ -676,9 +693,26 @@ def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
     )
 
     if clear_existing:
-        # A full rebuild is the documented fix for a model switch: drop the old
-        # vectors AND the stale index_meta so the re-populated index reflects the
-        # active model (the per-paper upserts below re-stamp meta).
+        # R1: probe the active model BEFORE destroying the index. A full rebuild
+        # is the documented fix for a model switch, but if the active model can't
+        # load (a typo'd EMBEDDING_MODEL, or offline with the model never
+        # downloaded), a naive DELETE would discard a RECOVERABLE index and then
+        # fail every per-paper embed — each after a paced arXiv fetch — leaving
+        # the user with an empty index and a misleading success. Fail fast with
+        # the index untouched instead.
+        try:
+            _embed_text("dimension probe")
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": (
+                    f"The active embedding model ({_current_identity()}) failed "
+                    f"to load ({exc}); the semantic index was left untouched. "
+                    "Check EMBEDDING_MODEL / network connectivity and retry."
+                ),
+            }
+        # Drop the old vectors AND the stale index_meta so the re-populated index
+        # reflects the active model (the per-paper upserts below re-stamp meta).
         with closing(_connect()) as conn:
             conn.execute("DELETE FROM semantic_index")
             conn.execute("DELETE FROM index_meta")
@@ -726,12 +760,23 @@ def rebuild_index(clear_existing: bool = True) -> Dict[str, Any]:
         else:
             failed.append(paper_id)
 
-    return {
+    result: Dict[str, Any] = {
         "status": "success",
         "indexed": indexed,
         "failed": failed,
         "total_local_papers": len(paper_ids),
     }
+    # R1: if there were papers to index and NONE succeeded, this is a failure —
+    # not a success with indexed=0. Under clear_existing the index is now empty,
+    # so surfacing "success" would hide that the rebuild wiped the corpus. (An
+    # empty corpus — no local papers at all — stays "success": nothing to do.)
+    if indexed == 0 and failed:
+        result["status"] = "error"
+        result["message"] = (
+            f"No papers were indexed ({len(failed)} failed); the semantic index "
+            "is now empty/cleared. See the failed list."
+        )
+    return result
 
 
 async def handle_reindex(arguments: Dict[str, Any]) -> List[types.TextContent]:
@@ -816,18 +861,16 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
         # only write on this path is a single index_paper_by_id upsert, never a
         # clear+rebuild, so an early release cannot expose a cleared index.
         async with _get_reindex_lock():
+            # R2 / F6: identity-only compatibility check BEFORE any model load or
+            # index-on-miss, in BOTH modes. Query mode: avoids loading/downloading
+            # the embedding model only to reject an incompatible index. paper_id
+            # mode: returns the actionable reindex guidance instead of the generic
+            # "Could not index source paper" that the on-miss upsert would trigger.
+            early_compat = _index_compat_error(None)
+            if early_compat:
+                return [types.TextContent(type="text", text=f"Error: {early_compat}")]
+
             if paper_id:
-                # F6: check index compatibility BEFORE the index-on-miss attempt.
-                # Otherwise an incompatible index makes the on-miss upsert refuse
-                # the write, and the user sees the generic "Could not index source
-                # paper" instead of the actionable reindex guidance. No query
-                # vector yet, so this is the model-identity check only (the dim
-                # check needs a vector and runs in the shared guard below).
-                early_compat = _index_compat_error(None)
-                if early_compat:
-                    return [
-                        types.TextContent(type="text", text=f"Error: {early_compat}")
-                    ]
                 query_vector = _get_indexed_paper_vector(paper_id)
                 if query_vector is None:
                     logger.info(
@@ -847,19 +890,28 @@ async def handle_semantic_search(arguments: Dict[str, Any]) -> List[types.TextCo
                 candidates = _load_vectors(exclude_paper_id=paper_id)
                 mode = "similar_to_paper"
                 query_payload = paper_id
+                # No post-vector guard in paper_id mode: a stored source vector
+                # shares the index's single dimension by construction (the write
+                # guard enforces one model/dim), and the early identity check
+                # above already caught a model switch (R2 / fable F7a — drop the
+                # redundant second compat read).
             else:
                 query_vector = _embed_text(query)
                 candidates = _load_vectors()
                 mode = "semantic_query"
                 query_payload = query
 
-            # Refuse a search against an index built by a different embedding
-            # model BEFORE _rank_by_similarity does `matrix @ query_vector`
-            # (which raises a bare numpy shape error on a dim mismatch). Return
-            # the friendly "run reindex" guidance instead (B23).
-            compat_error = _index_compat_error(query_vector)
-            if compat_error:
-                return [types.TextContent(type="text", text=f"Error: {compat_error}")]
+                # Post-embed DIMENSION guard (query mode only): a query vector
+                # whose dim disagrees with the stored vectors would crash
+                # _rank_by_similarity's `matrix @ query_vector`. Reachable only if
+                # the model's output dim disagrees with the index despite a
+                # matching identity (identity match implies dim match in
+                # production; a stubbed embed in tests can force it).
+                compat_error = _index_compat_error(query_vector)
+                if compat_error:
+                    return [
+                        types.TextContent(type="text", text=f"Error: {compat_error}")
+                    ]
 
             ranked = _rank_by_similarity(
                 query_vector, candidates, max_results=max_results, offset=offset

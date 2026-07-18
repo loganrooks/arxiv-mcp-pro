@@ -40,6 +40,12 @@ def semantic_test_env(monkeypatch, temp_storage_path):
     )
     monkeypatch.setattr(semantic_module, "SentenceTransformer", object)
     monkeypatch.setattr(semantic_module, "_get_model", lambda: DummyModel())
+    # R5: hermetic against a real EMBEDDING_MODEL in the environment — pin the
+    # override to None so tests see the default per-backend model name unless a
+    # test sets it explicitly. Settings() reads env vars, so without this a
+    # developer's exported EMBEDDING_MODEL would change identities and break the
+    # B23 compat-guard assertions.
+    monkeypatch.setattr(semantic_module.settings, "EMBEDDING_MODEL", None)
     semantic_module._model = None
 
 
@@ -639,9 +645,10 @@ def test_model2vec_embed_path_does_not_renormalize(monkeypatch):
 
     class _StaticModelFactory:
         @staticmethod
-        def from_pretrained(name, normalize=False):
+        def from_pretrained(name, normalize=False, force_download=True):
             captured["name"] = name
             captured["normalize"] = normalize
+            captured["force_download"] = force_download
             return DummyStaticModel([3.0, 4.0])  # norm 5 -> unit iff re-normalized
 
     monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
@@ -652,9 +659,10 @@ def test_model2vec_embed_path_does_not_renormalize(monkeypatch):
     vector = semantic_module._embed_text("hello")
 
     # Loaded through the model2vec path with the default model name AND the
-    # cosine-safety kwarg (F5).
+    # cosine-safety kwarg (F5) AND the cache-friendly force_download=False (R3).
     assert captured["name"] == "minishlab/potion-retrieval-32M"
     assert captured["normalize"] is True
+    assert captured["force_download"] is False
     assert isinstance(semantic_module._get_model(), DummyStaticModel)
     # Returned untouched — NOT collapsed to a unit vector by _embed_text.
     assert np.allclose(vector, np.array([3.0, 4.0], dtype=np.float32))
@@ -667,7 +675,7 @@ def test_embedding_model_override_model2vec(monkeypatch):
 
     class _StaticModelFactory:
         @staticmethod
-        def from_pretrained(name, normalize=False):
+        def from_pretrained(name, normalize=False, force_download=True):
             captured["name"] = name
             captured["normalize"] = normalize
             return DummyStaticModel([1.0, 0.0])
@@ -1100,6 +1108,56 @@ async def test_reindex_no_clear_refuses_model_switch(semantic_test_env, monkeypa
     assert "clear_existing=true" in payload["message"]
 
 
+@pytest.mark.asyncio
+async def test_reindex_clear_probe_failure_leaves_index_intact(
+    semantic_test_env, monkeypatch
+):
+    """R1: reindex(clear_existing=true) probes the active model BEFORE the DELETE.
+    If the model fails to load, the index is left untouched and an error is
+    returned — a recoverable index is not destroyed by a typo'd/offline model."""
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+    _index_three_papers()  # 3 rows written (via DummyModel) BEFORE the probe stub
+
+    def _boom(text):
+        raise RuntimeError("model failed to load")
+
+    monkeypatch.setattr(semantic_module, "_embed_text", _boom)
+
+    response = await semantic_module.handle_reindex({"clear_existing": True})
+    payload = json.loads(response[0].text)
+    assert payload["status"] == "error"
+    assert "left untouched" in payload["message"]
+
+    # The DELETE never ran — all rows are intact.
+    conn = semantic_module._connect()
+    try:
+        n = conn.execute("SELECT COUNT(*) AS c FROM semantic_index").fetchone()["c"]
+    finally:
+        conn.close()
+    assert n == 3
+
+
+@pytest.mark.asyncio
+async def test_reindex_clear_all_papers_fail_returns_error(
+    semantic_test_env, monkeypatch, temp_storage_path
+):
+    """R1: after a clear, if there were papers to index and NONE succeeded, the
+    result is status 'error' (not 'success' with indexed=0) — the cleared index
+    is now empty and that must not read as success."""
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+    Path(temp_storage_path, "2301.00001.md").write_text("paper", encoding="utf-8")
+    Path(temp_storage_path, "2301.00002.md").write_text("paper", encoding="utf-8")
+
+    # Probe succeeds (DummyModel via the fixture), but every per-paper index fails.
+    monkeypatch.setattr(semantic_module, "index_paper_by_id", lambda pid: False)
+
+    response = await semantic_module.handle_reindex({"clear_existing": True})
+    payload = json.loads(response[0].text)
+    assert payload["status"] == "error"
+    assert payload["indexed"] == 0
+    assert set(payload["failed"]) == {"2301.00001", "2301.00002"}
+
+
 def test_model2vec_empty_string_zero_vector_no_nan(monkeypatch):
     """model2vec returns a zero vector for empty text; _embed_text leaves it as-is
     (no divide-by-norm -> no NaN), and a zero query vector ranks with score 0."""
@@ -1112,7 +1170,7 @@ def test_model2vec_empty_string_zero_vector_no_nan(monkeypatch):
 
     class _Factory:
         @staticmethod
-        def from_pretrained(name, normalize=False):
+        def from_pretrained(name, normalize=False, force_download=True):
             return _ZeroStatic()
 
     monkeypatch.setattr(semantic_module, "SentenceTransformer", None)

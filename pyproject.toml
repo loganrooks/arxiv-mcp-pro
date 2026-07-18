@@ -91,8 +91,9 @@ pro = [
     # tokenizers, versus the ~600 MB sentence-transformers→torch chain it
     # replaces. Its default model is `minishlab/potion-retrieval-32M`
     # (retrieval-tuned, 512-dim). Users who want byte-identical parity with the
-    # pre-0.9 all-MiniLM-L6-v2 embeddings install `[pro-st]` instead; when both
-    # are present sentence-transformers wins (see semantic_search._active_backend).
+    # previous default (all-MiniLM-L6-v2) embeddings install `[pro-st]` instead;
+    # when both are present sentence-transformers wins (see
+    # semantic_search._active_backend).
     "model2vec>=0.8.0",
     "numpy>=1.26.0",
 ]
