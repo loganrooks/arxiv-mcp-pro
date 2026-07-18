@@ -32,6 +32,20 @@ driven by multi-agent field use.
   listing — are paced too (see the B20 Fixed entry below).
 
 ### Changed
+- **`search_papers` reports the real corpus-wide match count** (B16). `total_results`
+  is now the arXiv feed's `opensearch:totalResults` — the total number of papers matching
+  the query — instead of `len(page)` (which was always ≤ `max_results` and misleading). A
+  new `returned` field carries the page size (the count `total_results` used to report).
+  `total_results` falls back to the page size on the rare occasion the feed omits the
+  `opensearch:totalResults` element. `search_papers` also now runs through a **single code
+  path**: both date-filtered and plain queries route through the raw-HTTP helper (the
+  arxiv-package branch, which space-joined its clauses, is gone), so behaviour no longer
+  diverges by whether a date filter is present. Two consequences of retiring the
+  arxiv-package branch for previously-package-path (non-date) queries: the `published`
+  field is now serialized as the feed's raw timestamp (e.g. `2023-01-01T00:00:00Z`)
+  rather than a Python `isoformat()` string (`...+00:00`); and error messages use the
+  raw-path wording — the old `Error: ArXiv API error - ...` prefix is gone, and rate-limit
+  and HTTP errors now surface the raw path's messages.
 - **`read_paper` / `download_paper` now cap the default content return** at
   `CONTENT_DEFAULT_MAX_CHARS` (60000 chars) when `max_chars` is omitted (B12).
   Uncapped whole-paper defaults (~137k chars observed) overflowed MCP clients'
@@ -54,6 +68,43 @@ driven by multi-agent field use.
   `pip install` shrinks from ~77 MB / 46 packages to ~53 MB / 40 packages.
 
 ### Fixed
+- **`search_papers`' category filter is now a strict `AND`** (B16). Non-date queries
+  previously went through the arxiv Python package, which joined the query group and the
+  category group with a bare space — and a space is *not* `AND` on the arXiv API (it ranks
+  loosely, closer to `OR`), so the `categories` filter was advisory rather than strict and
+  off-topic results leaked in (e.g. `survey` + `cs.HC OR cs.CY` returned astronomy
+  sky-surveys). All queries now route through the raw-HTTP helper, which joins clauses with
+  an explicit `AND`. Every outbound GET inside the rate-limited helper now also records the
+  request against the cross-process pacer clock (previously only the pre-request pace was
+  recorded).
+- **`search_papers` query text is now properly percent-encoded** (B16). The old
+  encoder only turned spaces into `+`, so reserved characters in a query silently corrupted
+  the request: `C#` truncated the URL at the `#` (dropping the category/date/`max_results`
+  parameters that followed), `R&D` split the query at the `&`, and `C++` reached arXiv as
+  two spaces. User-supplied query and category text is now percent-encoded (`urllib.parse.quote`),
+  keeping only the arXiv query syntax literal (quotes for phrases, parentheses for grouping,
+  the colon in field prefixes like `ti:`/`cat:`); the boolean operators and the date filter's
+  literal `+TO+` are unaffected. `categories` values are additionally validated against a
+  strict token grammar, so a value carrying whitespace, a boolean operator, a wildcard, or a
+  URL delimiter (e.g. `cs.AI OR all:*`, `cs.AI&max_results=1000`) is rejected rather than
+  interpolated into the URL; a well-formed but unknown subcategory (`cs.NOTREAL`) is still
+  accepted as before.
+- **`search_papers` no longer mangles old-style arXiv ids with a `v` in the name**
+  (B16). The short-id parser stripped from the first `v` rather than a terminal version
+  suffix, so `solv-int/9501001v1` collapsed to `sol`; it now strips only a trailing `vN`
+  (`solv-int/9501001v1` → `solv-int/9501001`, `2401.12345v2` → `2401.12345`).
+- **`search_papers` / `check_alerts` now surface arXiv API errors instead of a bogus
+  result** (B16). arXiv reports a bad query as an HTTP-200 Atom feed with a single
+  `/api/errors` entry (and `opensearch:totalResults` of 1), which the unified raw-HTTP
+  parser treated as a real 1-paper result; it now detects that entry and raises with the
+  feed's error text, so `search_papers` returns an `Error:` message and `check_alerts`
+  records it as that topic's per-topic error (restoring the behaviour the deleted
+  arxiv-package path had).
+- **Saved watch-topic categories can no longer bypass category validation** (B16).
+  `watch_topic` now validates `categories` at save time (rejecting a malformed value before
+  it is persisted), and `_raw_arxiv_search` enforces the strict category-token grammar as a
+  backstop, so a malformed/injection value in a stored watch (e.g. `cs.AI OR all:*`) is
+  rejected before any request is built rather than interpolated into the arXiv URL.
 - **The remaining arXiv call sites now pace through the cross-process limiter** (B20). The
   semantic-index metadata fetches — `PaperManager.store_paper` / `list_resources` and
   `index_paper_by_id` (used by the `reindex` loop, `semantic_search`'s on-demand source-paper

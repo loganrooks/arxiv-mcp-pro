@@ -590,6 +590,81 @@ def _resp(status_code, headers=None):
     return r
 
 
+def _stub_recorder(monkeypatch):
+    """Neutralise pace / cooldown / sleep (no real storage, no waiting) and return
+    a MagicMock standing in for ``record_arxiv_request`` so a test can assert how
+    many network attempts ``_rate_limited_get`` recorded."""
+    rec = MagicMock()
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.record_arxiv_request", rec)
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.pace_arxiv_request", AsyncMock())
+    monkeypatch.setattr(
+        "arxiv_mcp_server.tools.search.record_arxiv_cooldown", MagicMock()
+    )
+
+    async def _no_sleep(secs):
+        pass
+
+    monkeypatch.setattr("arxiv_mcp_server.tools.search.asyncio.sleep", _no_sleep)
+    return rec
+
+
+# The record-after contract (B16 fix 4): _rate_limited_get must record exactly one
+# request per attempted GET (record-even-on-failure), so sibling lanes pace off
+# every attempt. These assert the boundary call_count — reverting either
+# record_arxiv_request finally-block turns one of them red.
+
+
+@pytest.mark.asyncio
+async def test_record_after_success_once(monkeypatch):
+    """One successful GET → one record."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(return_value=_resp(200))
+
+    await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_record_after_timeout_then_success_twice(monkeypatch):
+    """Timeout then a successful retry → one record per GET = 2."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=[httpx.TimeoutException("boom"), _resp(200)])
+
+    await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_after_429_then_success_twice(monkeypatch):
+    """429 (short Retry-After) then a successful retry → 2 records."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=[_resp(429, {"Retry-After": "1"}), _resp(200)])
+
+    await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_after_429_then_timeout_twice(monkeypatch):
+    """429 then a timed-out retry still records both attempts (2) and fails fast."""
+    rec = _stub_recorder(monkeypatch)
+    client = MagicMock()
+    client.get = AsyncMock(
+        side_effect=[_resp(429, {"Retry-After": "1"}), httpx.TimeoutException("boom")]
+    )
+
+    with pytest.raises(RuntimeError):
+        await _rate_limited_get(client, "https://example.test/q")
+
+    assert rec.call_count == 2
+
+
 @pytest.mark.asyncio
 async def test_retry_after_short_retries_once_and_succeeds(monkeypatch):
     """429 with a short Retry-After is slept out, then retried once → 200."""
@@ -841,8 +916,10 @@ async def test_429_no_header_publishes_default_cooldown(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_search_paces_once(mock_client, monkeypatch):
-    """search_papers (client path) calls pace_arxiv_request exactly once."""
+async def test_handle_search_paces_once(monkeypatch):
+    """search_papers routes through _raw_arxiv_search → _rate_limited_get, which
+    calls pace_arxiv_request exactly once for a single successful GET (B16 unified
+    the old arxiv-package path onto the raw-HTTP path)."""
     calls = []
 
     async def _recording_pace():
@@ -851,10 +928,26 @@ async def test_handle_search_paces_once(mock_client, monkeypatch):
     monkeypatch.setattr(
         "arxiv_mcp_server.tools.search.pace_arxiv_request", _recording_pace
     )
+    # Neutralise the recorder so this test never touches the real storage dir.
     monkeypatch.setattr(
-        "arxiv_mcp_server.tools.search.get_arxiv_client",
-        lambda *a, **k: mock_client,
+        "arxiv_mcp_server.tools.search.record_arxiv_request", MagicMock()
     )
+
+    # Stub the httpx client so the (real) _rate_limited_get returns canned XML.
+    mock_response = MagicMock()
+    mock_response.text = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom" '
+        'xmlns:arxiv="http://arxiv.org/schemas/atom"></feed>'
+    )
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=mock_client))
 
     result = await handle_search({"query": "test", "max_results": 1})
 

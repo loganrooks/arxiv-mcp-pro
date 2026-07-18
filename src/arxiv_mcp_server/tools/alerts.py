@@ -16,7 +16,7 @@ from mcp.types import ToolAnnotations
 from dateutil import parser
 
 from ..config import Settings
-from .search import _raw_arxiv_search
+from .search import _raw_arxiv_search, _validate_categories
 
 logger = logging.getLogger("arxiv-mcp-pro")
 settings = Settings()
@@ -175,6 +175,17 @@ async def handle_watch_topic(arguments: Dict[str, Any]) -> List[types.TextConten
             return [types.TextContent(type="text", text="Error: topic is required")]
 
         categories = arguments.get("categories") or []
+        # Reject malformed/injection category values at WRITE time, so a bad value
+        # can never be persisted and then replayed unchecked by check_alerts (the
+        # _raw_arxiv_search backstop would catch it at poll time, but rejecting at
+        # save time gives the caller an immediate, actionable error).
+        if categories and not _validate_categories(categories):
+            return [
+                types.TextContent(
+                    type="text",
+                    text="Error: Invalid category provided. Please check arXiv category names.",
+                )
+            ]
         max_results = min(int(arguments.get("max_results", 10)), settings.MAX_RESULTS)
 
         payload = _load_watches()

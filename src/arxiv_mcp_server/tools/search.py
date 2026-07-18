@@ -1,18 +1,19 @@
 """Search functionality for the arXiv MCP server."""
 
-import arxiv
 import json
 import logging
+import re
 import httpx
 import asyncio
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple, Union
 from datetime import datetime, timezone
+from urllib.parse import quote, urlparse
 from dateutil import parser
 import mcp.types as types
 from mcp.types import ToolAnnotations
-from ..config import Settings, get_arxiv_client
+from ..config import Settings
 from .arxiv_pacing import (
     pace_arxiv_request,
     record_arxiv_request,
@@ -109,7 +110,13 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
         # undercut by the fixed 5s timeout backoff).
         await pace_arxiv_request()
         try:
-            response = await client.get(url, headers=ARXIV_HEADERS)
+            # Pace-before / record-after (matching download.py + papers.py): the
+            # GET hit arXiv whether or not it succeeded, so record it in the
+            # finally so sibling lanes pace off this attempt even on timeout.
+            try:
+                response = await client.get(url, headers=ARXIV_HEADERS)
+            finally:
+                record_arxiv_request()
             if response.status_code in (429, 503):
                 retry_after = _parse_retry_after(response.headers.get("Retry-After"))
                 if retry_after is not None and retry_after <= _RETRY_AFTER_MAX_SLEEP:
@@ -140,6 +147,10 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
                             "arXiv retry after rate-limit cooldown timed out — "
                             "not retrying further"
                         )
+                    finally:
+                        # The retry GET hit arXiv too — record it (success or
+                        # timeout) so sibling lanes pace off the latest attempt.
+                        record_arxiv_request()
                     if retry_response.status_code in (429, 503):
                         retry_after2 = _parse_retry_after(
                             retry_response.headers.get("Retry-After")
@@ -182,10 +193,12 @@ async def _rate_limited_get(client: httpx.AsyncClient, url: str) -> httpx.Respon
 # Use HTTPS to avoid redirect from http -> https
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 
-# XML namespaces used in arXiv Atom feed
+# XML namespaces used in arXiv Atom feed. ``opensearch`` carries the feed-level
+# totalResults (the corpus-wide match count, distinct from the page size).
 ARXIV_NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
+    "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
 }
 
 # Valid arXiv category prefixes for validation
@@ -212,6 +225,38 @@ VALID_CATEGORIES = {
     "quant-ph",
 }
 
+# A well-formed arXiv category token: a lowercase archive prefix (letters/hyphens,
+# e.g. cs, astro-ph, cond-mat, q-bio) optionally followed by a single dotted
+# subcategory (e.g. .AI, .gen-ph). Deliberately rejects whitespace, boolean
+# operators, wildcards, and URL delimiters (& = # : *) so a category value cannot
+# smuggle extra query syntax or parameters into the request URL.
+_CATEGORY_TOKEN = re.compile(r"^[a-z][a-z-]*(\.[A-Za-z-]+)?$")
+
+# Characters kept LITERAL when percent-encoding user-supplied query text: the
+# double quote (phrase queries), the colon (field prefixes ti:/au:/abs:/cat:),
+# and parentheses (grouping). Everything else — including #, &, %, a literal +,
+# and any non-ASCII — is percent-encoded so it lands inside the search_query
+# value instead of truncating the URL (#), splitting off a spurious parameter
+# (&), or being read as a space (+). See _encode_query_text.
+_QUERY_SAFE = '":()'
+
+
+def _encode_query_text(text: str) -> str:
+    """Percent-encode user-supplied arXiv query text for the ``search_query`` param.
+
+    Keeps the arXiv query syntax that must survive on the wire literal (double
+    quotes for phrases, the colon in field prefixes like ``ti:``/``cat:``, and
+    parentheses for grouping) via :data:`_QUERY_SAFE`; percent-encodes everything
+    else — notably ``#``, ``&``, ``%``, a literal ``+``, and non-ASCII — so a
+    reserved character in user input cannot corrupt the URL. Spaces become
+    ``%20`` (arXiv decodes ``%20`` and ``+`` identically inside the query, and the
+    boolean operators AND/OR/ANDNOT survive as tokens either way). The structural
+    separators (``+AND+``/``+OR+``) and the internally-built date filter's
+    ``+TO+`` are the CALLER's literals, added after this call, so they stay
+    literal on the wire.
+    """
+    return quote(text, safe=_QUERY_SAFE)
+
 
 async def _raw_arxiv_search(
     query: str,
@@ -220,24 +265,53 @@ async def _raw_arxiv_search(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     categories: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
+    return_total: bool = False,
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Optional[int]]]:
     """
     Perform arXiv search using raw HTTP requests.
 
     This bypasses the arxiv Python package to avoid URL encoding issues
     with date filters. The arxiv package encodes '+' as '%2B' which breaks
     the submittedDate:[YYYYMMDD+TO+YYYYMMDD] syntax.
+
+    Query, category, and date clauses are joined with an explicit ``AND`` (a bare
+    space is NOT ``AND`` on the arXiv API — it ranks loosely, closer to ``OR``,
+    which makes a category clause advisory rather than strict).
+
+    By default returns just the list of paper dicts (back-compat for callers like
+    ``alerts.py``). When ``return_total`` is True, returns
+    ``(papers, total_results)`` where ``total_results`` is the feed-level
+    ``opensearch:totalResults`` — the corpus-wide match count, or ``None`` when the
+    feed omits it.
     """
-    # Build query components
-    query_parts = []
+    # Build the search_query clauses. Two parallel lists: ``clauses`` are
+    # already-URL-encoded fragments (user text percent-encoded via
+    # _encode_query_text; structural syntax kept literal) that get joined with the
+    # literal ``+AND+`` separator; ``readable`` mirrors them un-encoded for the
+    # debug log only.
+    clauses: List[str] = []
+    readable: List[str] = []
 
     if query.strip():
-        query_parts.append(f"({query})")
+        clauses.append(f"({_encode_query_text(query)})")
+        readable.append(f"({query})")
 
-    # Add category filtering
+    # Add category filtering. This is the SECURITY backstop for callers that reach
+    # the helper directly without going through handle_search's _validate_categories
+    # (e.g. check_alerts replaying saved-topic categories): every category must pass
+    # the strict token grammar before it is interpolated into the URL, so a value
+    # carrying whitespace, a boolean operator, a wildcard, or a URL delimiter is
+    # rejected here (raising BEFORE any network call) rather than smuggled onto the
+    # wire. handle_search still pre-validates for a friendlier early error + prefix
+    # warning; this is the last line of defence. Each value is also percent-encoded
+    # (defence in depth), while the ``cat:`` prefix and ``+OR+`` separator stay literal.
     if categories:
-        category_filter = " OR ".join(f"cat:{cat}" for cat in categories)
-        query_parts.append(f"({category_filter})")
+        for cat in categories:
+            if not _CATEGORY_TOKEN.match(cat):
+                raise ValueError(f"Invalid category: {cat!r}")
+        cat_group = "+OR+".join(f"cat:{_encode_query_text(cat)}" for cat in categories)
+        clauses.append(f"({cat_group})")
+        readable.append("(" + " OR ".join(f"cat:{cat}" for cat in categories) + ")")
 
     # Add date filtering using arXiv API syntax
     if date_from or date_to:
@@ -252,20 +326,26 @@ async def _raw_arxiv_search(
             else:
                 end_date = datetime.now().strftime("%Y%m%d2359")
 
-            # CRITICAL: This must NOT be URL-encoded. The '+' in '+TO+' must remain literal.
+            # This filter is internally built (no user text), so it is appended
+            # to the encoded clauses verbatim. CRITICAL: the '+' in '+TO+' must
+            # remain literal — httpx preserves it on the wire; percent-encoding it
+            # to %2B breaks the range syntax.
             date_filter = f"submittedDate:[{start_date}+TO+{end_date}]"
-            query_parts.append(date_filter)
+            clauses.append(date_filter)
+            readable.append(date_filter)
             logger.debug(f"Added date filter: {date_filter}")
         except (ValueError, TypeError) as e:
             logger.error(f"Error parsing dates: {e}")
             raise ValueError(f"Invalid date format. Use YYYY-MM-DD format: {e}")
 
-    if not query_parts:
+    if not clauses:
         raise ValueError("No search criteria provided")
 
-    # Combine query parts with AND (space in arXiv = AND)
-    final_query = " AND ".join(query_parts)
-    logger.debug(f"Raw API query: {final_query}")
+    # Join the clauses with an explicit AND. A bare space is NOT AND on the arXiv
+    # API (it ranks loosely, closer to OR), which is why the category filter must
+    # be AND-joined to stay strict.
+    encoded_query = "+AND+".join(clauses)
+    logger.debug(f"Raw API query: {' AND '.join(readable)}")
 
     # Map sort parameter to arXiv API values
     sort_map = {
@@ -274,18 +354,8 @@ async def _raw_arxiv_search(
     }
     sort_order = "descending"
 
-    # Build the URL manually to avoid encoding the '+' in date ranges
-    # We encode most parameters but carefully preserve '+TO+' in date filters
+    # Non-user params (max_results is an int, sortBy is mapped to a fixed token).
     base_params = f"max_results={max_results}&sortBy={sort_map.get(sort_by, 'relevance')}&sortOrder={sort_order}"
-
-    # Manually construct search_query parameter
-    # We need to encode spaces and special chars BUT NOT the '+' in '+TO+'
-    # Strategy: encode the query parts separately, then join with encoded AND
-    encoded_query = (
-        final_query.replace(" AND ", "+AND+").replace(" OR ", "+OR+").replace(" ", "+")
-    )
-    # But we need to be careful about existing '+TO+' - it should stay as-is
-    # Since we built the date filter with literal '+TO+', it's already correct
 
     url = f"{ARXIV_API_URL}?search_query={encoded_query}&{base_params}"
     logger.debug(f"Raw API URL: {url}")
@@ -295,15 +365,34 @@ async def _raw_arxiv_search(
         response = await _rate_limited_get(client, url)
 
     # Parse the Atom XML response
-    return _parse_arxiv_atom_response(response.text)
+    papers, total_results = _parse_arxiv_atom_response(response.text)
+    if return_total:
+        return papers, total_results
+    return papers
 
 
-def _parse_arxiv_atom_response(xml_text: str) -> List[Dict[str, Any]]:
-    """Parse arXiv Atom XML response into paper dictionaries."""
+def _parse_arxiv_atom_response(
+    xml_text: str,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """Parse arXiv Atom XML response into ``(paper dicts, total_results)``.
+
+    ``total_results`` is the feed-level ``opensearch:totalResults`` — the
+    corpus-wide count of papers matching the query, independent of the page size —
+    or ``None`` when the element is absent or unparseable.
+    """
     results = []
+    total_results: Optional[int] = None
 
     try:
         root = ET.fromstring(xml_text)
+
+        # Feed-level corpus-wide match count (distinct from the page size).
+        total_elem = root.find("opensearch:totalResults", ARXIV_NS)
+        if total_elem is not None and total_elem.text:
+            try:
+                total_results = int(total_elem.text.strip())
+            except (ValueError, TypeError):
+                total_results = None
 
         for entry in root.findall("atom:entry", ARXIV_NS):
             # Extract paper ID from the id URL
@@ -311,10 +400,32 @@ def _parse_arxiv_atom_response(xml_text: str) -> List[Dict[str, Any]]:
             if id_elem is None or id_elem.text is None:
                 continue
 
+            id_text = id_elem.text.strip()
+
+            # arXiv reports API errors as an HTTP-200 Atom feed whose single entry
+            # has an id under /api/errors, title "Error", and the error text in
+            # <summary> (opensearch:totalResults is 1, so this would otherwise look
+            # like a genuine 1-paper result and callers would surface a bogus
+            # paper). Detect it by the id PATH — robust to http/https and any
+            # fragment — and raise so callers treat it as a failure: handle_search
+            # returns it as an "Error: ..." message, check_alerts records it as the
+            # topic's per-topic error. The deleted arxiv-package path raised on
+            # these; this restores that behaviour after unification.
+            if urlparse(id_text).path.rstrip("/").endswith("/api/errors"):
+                summary_elem = entry.find("atom:summary", ARXIV_NS)
+                detail = (
+                    summary_elem.text.strip().replace("\n", " ")
+                    if summary_elem is not None and summary_elem.text
+                    else "unknown error"
+                )
+                raise ValueError(f"arXiv API error: {detail}")
+
             # ID format: http://arxiv.org/abs/XXXX.XXXXX or http://arxiv.org/abs/category/XXXXXXX
-            paper_id = id_elem.text.split("/abs/")[-1]
-            # Remove version suffix for short ID
-            short_id = paper_id.split("v")[0] if "v" in paper_id else paper_id
+            paper_id = id_text.split("/abs/")[-1]
+            # Strip only a TERMINAL version suffix (v1, v2, ...). A blunt
+            # split("v") corrupts old-style archive ids whose name contains a
+            # 'v' (e.g. solv-int/9501001v1 -> "sol"); anchor to the end instead.
+            short_id = re.sub(r"v\d+$", "", paper_id)
 
             # Title
             title_elem = entry.find("atom:title", ARXIV_NS)
@@ -384,13 +495,23 @@ def _parse_arxiv_atom_response(xml_text: str) -> List[Dict[str, Any]]:
         logger.error(f"Failed to parse arXiv XML response: {e}")
         raise ValueError(f"Failed to parse arXiv API response: {e}")
 
-    return results
+    return results, total_results
 
 
 search_tool = types.Tool(
     name="search_papers",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     description="""Search for papers on arXiv with advanced filtering and query optimization.
+
+QUERY SEMANTICS: A bare space between terms is NOT treated as AND by the arXiv API — it ranks
+results loosely (closer to OR), which makes a category filter advisory rather than strict. This
+server joins the query, category, and date clauses with an explicit AND, so `categories` acts as
+a hard filter. Note that `sort_by: "date"` returns a recency firehose only weakly filtered by the
+query (observed in field use: near-identical result sets across different queries), so prefer
+`sort_by: "relevance"` (the default) for topical search. In the response, `total_results` is the
+corpus-wide count of papers matching the query (from the feed's opensearch:totalResults; it falls
+back to the page size on the rare occasion the feed omits that element) and `returned` is the
+number of papers actually in this page.
 
 QUERY CONSTRUCTION GUIDELINES:
 - Use QUOTED PHRASES for exact matches: "multi-agent systems", "neural networks", "machine learning"
@@ -496,12 +617,21 @@ TIPS FOR FOUNDATIONAL RESEARCH:
 
 
 def _validate_categories(categories: List[str]) -> bool:
-    """Validate that all provided categories are valid arXiv categories."""
+    """Validate that all provided categories are well-formed arXiv categories.
+
+    Two gates. First a strict full-token grammar (:data:`_CATEGORY_TOKEN`) rejects
+    anything carrying whitespace, boolean operators, wildcards, or URL delimiters
+    (``cs.AI OR all:*``, ``cs.AI&max_results=1000``, ``cs AI``) — closing a query/
+    parameter-injection vector, since category values are interpolated into the
+    request URL. Then the archive prefix must be a known arXiv archive. A
+    well-formed but unknown SUBcategory (e.g. ``cs.NOTREAL``) is allowed: arXiv
+    tolerates unknown subcategories, so this stays prefix-level like before.
+    """
     for category in categories:
-        if "." in category:
-            prefix = category.split(".")[0]
-        else:
-            prefix = category
+        if not _CATEGORY_TOKEN.match(category):
+            logger.warning(f"Malformed category token rejected: {category!r}")
+            return False
+        prefix = category.split(".")[0]
         if prefix not in VALID_CATEGORIES:
             logger.warning(f"Unknown category prefix: {prefix}")
             return False
@@ -535,26 +665,18 @@ def _optimize_query(query: str) -> str:
     return query
 
 
-def _process_paper(paper: arxiv.Result) -> Dict[str, Any]:
-    """Process paper information with resource URI."""
-    return {
-        "id": paper.get_short_id(),
-        "title": paper.title,
-        "authors": [author.name for author in paper.authors],
-        "abstract": "[EXTERNAL CONTENT] " + paper.summary,
-        "categories": paper.categories,
-        "published": paper.published.isoformat(),
-        "url": paper.pdf_url,
-        "resource_uri": f"arxiv://{paper.get_short_id()}",
-    }
-
-
 async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
-    """Handle paper search requests with improved arXiv API integration.
+    """Handle paper search requests via the raw arXiv HTTP API.
 
-    Uses raw HTTP requests when date filtering is requested to avoid URL encoding
-    issues with the arxiv Python package. Falls back to the arxiv package for
-    non-date queries for better compatibility.
+    All queries — date-filtered or not — route through a single path
+    (:func:`_raw_arxiv_search`). It joins the query, category, and date clauses
+    with an explicit ``AND`` (a bare space is NOT ``AND`` on the arXiv API — it
+    ranks loosely, closer to ``OR``, which made the category filter advisory rather
+    than strict in the previous arxiv-package path), paces every request through
+    the cross-process rate limiter, and parses the Atom feed. The response reports
+    ``total_results`` (the corpus-wide match count from the feed's
+    ``opensearch:totalResults``, falling back to the page size when the feed omits
+    it) alongside ``returned`` (this page's size).
     """
     try:
         max_results = min(int(arguments.get("max_results", 10)), settings.MAX_RESULTS)
@@ -577,134 +699,47 @@ async def handle_search(arguments: Dict[str, Any]) -> List[types.TextContent]:
                 )
             ]
 
-        # Use raw HTTP API when date filtering is requested
-        # This bypasses the arxiv package's URL encoding which breaks date syntax
-        if date_from_arg or date_to_arg:
-            logger.debug(
-                f"Date filtering requested - using raw API: {date_from_arg} to {date_to_arg}"
+        optimized_query = _optimize_query(base_query) if base_query.strip() else ""
+        if optimized_query != base_query:
+            logger.debug(f"Optimized query: '{base_query}' -> '{optimized_query}'")
+
+        try:
+            papers, total = await _raw_arxiv_search(
+                query=optimized_query,
+                max_results=max_results,
+                sort_by=sort_by_arg,
+                date_from=date_from_arg,
+                date_to=date_to_arg,
+                categories=categories,
+                return_total=True,
             )
-
-            try:
-                optimized_query = (
-                    _optimize_query(base_query) if base_query.strip() else ""
-                )
-                results = await _raw_arxiv_search(
-                    query=optimized_query,
-                    max_results=max_results,
-                    sort_by=sort_by_arg,
-                    date_from=date_from_arg,
-                    date_to=date_to_arg,
-                    categories=categories,
-                )
-
-                logger.info(
-                    f"Raw API search completed: {len(results)} results returned"
-                )
-                response_data = {"total_results": len(results), "papers": results}
-
-                return [
-                    types.TextContent(
-                        type="text", text=json.dumps(response_data, indent=2)
-                    )
-                ]
-
-            except httpx.HTTPStatusError as e:
-                logger.error(f"arXiv API HTTP error: {e}")
-                return [
-                    types.TextContent(
-                        type="text", text=f"Error: arXiv API HTTP error - {str(e)}"
-                    )
-                ]
-            except ValueError as e:
-                return [types.TextContent(type="text", text=f"Error: {str(e)}")]
-
-        # For non-date queries, use the shared arxiv client (lazy, avoids eager import overhead)
-        client = get_arxiv_client(page_size=max_results)
-
-        # Build query components
-        query_parts = []
-
-        # Add base query with optimization
-        if base_query.strip():
-            optimized_query = _optimize_query(base_query)
-            query_parts.append(f"({optimized_query})")
-            if optimized_query != base_query:
-                logger.debug(f"Optimized query: '{base_query}' -> '{optimized_query}'")
-
-        # Add category filtering
-        if categories:
-            category_filter = " OR ".join(f"cat:{cat}" for cat in categories)
-            query_parts.append(f"({category_filter})")
-            logger.debug(f"Added category filter: {category_filter}")
-
-        # Combine query parts
-        if not query_parts:
+        except httpx.HTTPStatusError as e:
+            logger.error(f"arXiv API HTTP error: {e}")
             return [
                 types.TextContent(
-                    type="text", text="Error: No search criteria provided"
+                    type="text", text=f"Error: arXiv API HTTP error - {str(e)}"
                 )
             ]
+        except ValueError as e:
+            return [types.TextContent(type="text", text=f"Error: {str(e)}")]
 
-        # Combine query parts - arXiv uses space for AND by default
-        final_query = " ".join(query_parts)
-        logger.debug(f"Final arXiv query: {final_query}")
-
-        # Determine sort method
-        if sort_by_arg == "date":
-            sort_criterion = arxiv.SortCriterion.SubmittedDate
-            logger.debug("Using date sorting (newest first)")
-        else:
-            sort_criterion = arxiv.SortCriterion.Relevance
-            logger.debug("Using relevance sorting (most relevant first)")
-
-        search = arxiv.Search(
-            query=final_query,
-            max_results=max_results,
-            sort_by=sort_criterion,
+        returned = len(papers)
+        # Real corpus-wide match count from the feed; fall back to the page size
+        # when the feed omits opensearch:totalResults.
+        total_results = total if total is not None else returned
+        logger.info(
+            f"Search completed: {returned} returned of {total_results} total matches"
         )
-
-        # Respect arXiv's global (per-IP, cross-process) rate limit before the
-        # request. The arxiv library paces its own pages internally (delay_seconds
-        # default 3.0); pace_arxiv_request coordinates against sibling sessions.
-        await pace_arxiv_request()
-
-        # Process results — fail fast on rate limit, don't hammer the API
-        results = []
-        try:
-            for paper in client.results(search):
-                if len(results) >= max_results:
-                    break
-                results.append(_process_paper(paper))
-        except arxiv.ArxivError as e:
-            if "429" in str(e) or "rate" in str(e).lower() or "503" in str(e):
-                logger.warning(f"arXiv rate limited — not retrying: {e}")
-                # Publish a shared back-off (the arxiv lib exposes no header, so
-                # use the conservative default) before failing fast.
-                record_arxiv_cooldown(60.0)
-                raise RuntimeError(
-                    "arXiv is rate limiting this IP. Wait at least 60s before "
-                    "retrying — observed cooldowns can reach ~3 minutes under "
-                    "parallel use."
-                )
-            raise
-        finally:
-            # The library made 1..N of its own requests across the iteration
-            # (even a partial or failed one hit the network); record so sibling
-            # lanes pace off the last one whether or not it succeeded.
-            record_arxiv_request()
-
-        logger.info(f"Search completed: {len(results)} results returned")
-        response_data = {"total_results": len(results), "papers": results}
+        response_data = {
+            "total_results": total_results,
+            "returned": returned,
+            "papers": papers,
+        }
 
         return [
             types.TextContent(type="text", text=json.dumps(response_data, indent=2))
         ]
 
-    except arxiv.ArxivError as e:
-        logger.error(f"ArXiv API error: {e}")
-        return [
-            types.TextContent(type="text", text=f"Error: ArXiv API error - {str(e)}")
-        ]
     except Exception as e:
         logger.error(f"Unexpected search error: {e}")
         return [types.TextContent(type="text", text=f"Error: {str(e)}")]
