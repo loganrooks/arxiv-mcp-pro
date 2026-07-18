@@ -573,3 +573,372 @@ def test_index_paper_by_id_records_even_when_fetch_raises(monkeypatch):
 
     assert semantic_module.index_paper_by_id("2401.00001") is False
     assert events == ["pace", "fetch", "record"]
+
+
+# ---------------------------------------------------------------------------
+# B23: model2vec / sentence-transformers backend abstraction + index-compat guard
+# ---------------------------------------------------------------------------
+
+
+class DummyStaticModel:
+    """model2vec-style static model: `.encode(text)` returns a fixed vector.
+
+    The vector is deliberately NON-unit so a test can prove `_embed_text` does
+    not re-normalize it on the model2vec path (model2vec normalizes at encode
+    time; re-normalizing would change these values and inject NaN for a zero
+    vector).
+    """
+
+    def __init__(self, vector):
+        self._vector = vector
+
+    def encode(self, text):
+        return np.array(self._vector, dtype=np.float32)
+
+
+def _reset_model_globals(monkeypatch):
+    """Force _get_model to reload on the next call (mirrors the fixture reset)."""
+    monkeypatch.setattr(semantic_module, "_model", None)
+    monkeypatch.setattr(semantic_module, "_model_backend", None)
+    monkeypatch.setattr(semantic_module, "_model_name", None)
+
+
+def test_active_backend_prefers_sentence_transformers(monkeypatch):
+    """When both backends import, sentence-transformers wins (upgraders unaffected)."""
+    monkeypatch.setattr(semantic_module, "SentenceTransformer", object)
+    monkeypatch.setattr(semantic_module, "StaticModel", object)
+    assert semantic_module._active_backend() == "sentence-transformers"
+    assert semantic_module._dependency_error() is None
+
+
+def test_active_backend_model2vec_when_st_absent(monkeypatch):
+    """ST missing but model2vec present -> model2vec backend, no dependency error."""
+    monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
+    monkeypatch.setattr(semantic_module, "StaticModel", object)
+    assert semantic_module._active_backend() == "model2vec"
+    assert semantic_module._dependency_error() is None
+
+
+def test_active_backend_none_gives_two_extra_dependency_error(monkeypatch):
+    """No backend -> _active_backend None and the error names BOTH install extras."""
+    monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
+    monkeypatch.setattr(semantic_module, "StaticModel", None)
+    assert semantic_module._active_backend() is None
+    err = semantic_module._dependency_error()
+    assert err is not None
+    assert "[pro]" in err
+    assert "[pro-st]" in err
+
+
+def test_model2vec_embed_path_does_not_renormalize(monkeypatch):
+    """model2vec backend: _get_model loads via from_pretrained; _embed_text returns
+    the model's vector untouched (no re-normalization)."""
+    captured = {}
+
+    class _StaticModelFactory:
+        @staticmethod
+        def from_pretrained(name):
+            captured["name"] = name
+            return DummyStaticModel([3.0, 4.0])  # norm 5 -> unit iff re-normalized
+
+    monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
+    monkeypatch.setattr(semantic_module, "StaticModel", _StaticModelFactory)
+    monkeypatch.setattr(semantic_module.settings, "EMBEDDING_MODEL", None)
+    _reset_model_globals(monkeypatch)
+
+    vector = semantic_module._embed_text("hello")
+
+    # Loaded through the model2vec path with the default model name.
+    assert captured["name"] == "minishlab/potion-retrieval-32M"
+    assert isinstance(semantic_module._get_model(), DummyStaticModel)
+    # Returned untouched — NOT collapsed to a unit vector.
+    assert np.allclose(vector, np.array([3.0, 4.0], dtype=np.float32))
+    assert vector.dtype == np.float32
+
+
+def test_embedding_model_override_model2vec(monkeypatch):
+    """EMBEDDING_MODEL overrides the model2vec default passed to from_pretrained."""
+    captured = {}
+
+    class _StaticModelFactory:
+        @staticmethod
+        def from_pretrained(name):
+            captured["name"] = name
+            return DummyStaticModel([1.0, 0.0])
+
+    monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
+    monkeypatch.setattr(semantic_module, "StaticModel", _StaticModelFactory)
+    monkeypatch.setattr(
+        semantic_module.settings, "EMBEDDING_MODEL", "myorg/custom-static"
+    )
+    _reset_model_globals(monkeypatch)
+
+    semantic_module._get_model()
+    assert captured["name"] == "myorg/custom-static"
+
+
+def test_embedding_model_override_sentence_transformers(monkeypatch):
+    """EMBEDDING_MODEL overrides the ST default; the ST path keeps silent=True."""
+    captured = {}
+
+    class _STFactory:
+        def __init__(self, name, silent=False):
+            captured["name"] = name
+            captured["silent"] = silent
+
+        def encode(self, *args, **kwargs):
+            return np.zeros(3, dtype=np.float32)
+
+    monkeypatch.setattr(semantic_module, "SentenceTransformer", _STFactory)
+    monkeypatch.setattr(semantic_module, "StaticModel", None)
+    monkeypatch.setattr(semantic_module.settings, "EMBEDDING_MODEL", "myorg/custom-st")
+    _reset_model_globals(monkeypatch)
+
+    semantic_module._get_model()
+    assert captured["name"] == "myorg/custom-st"
+    assert captured["silent"] is True
+
+
+@pytest.mark.asyncio
+async def test_dim_mismatch_returns_reindex_error(semantic_test_env, monkeypatch):
+    """A query vector whose dimension differs from the stored vectors trips the
+    friendly reindex guard BEFORE _rank_by_similarity's `matrix @ query_vector`
+    can raise a bare numpy shape error (B23)."""
+    _index_three_papers()  # dim-3 vectors, index_meta stamped (ST, dim 3)
+
+    # Simulate the active model producing a different dimension than the index.
+    monkeypatch.setattr(
+        semantic_module, "_embed_text", lambda text: np.zeros(4, dtype=np.float32)
+    )
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer"}
+    )
+    text = response[0].text
+    assert "Error:" in text
+    assert "reindex" in text.lower()
+    # The guard fired, not a raw numpy shape/matmul error.
+    assert "matmul" not in text.lower()
+    assert "shapes" not in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_model_mismatch_returns_reindex_error(semantic_test_env, monkeypatch):
+    """A model switch with the SAME dimension is caught by the meta model-identity
+    check (not the dimension check) — fires the reindex guard."""
+    _index_three_papers()  # meta stamped with the default ST model
+
+    # Same backend + dimension, different model name -> meta no longer matches.
+    monkeypatch.setattr(semantic_module.settings, "EMBEDDING_MODEL", "different/model")
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer"}
+    )
+    text = response[0].text
+    assert "Error:" in text
+    assert "reindex" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_legacy_index_without_meta_searches_normally(semantic_test_env):
+    """A legacy pre-B23 index (rows present, no index_meta) with a matching
+    dimension must NOT trip the guard (no false positive)."""
+    _index_three_papers()
+
+    # Strip index_meta to mimic an index built before B23 added the table.
+    conn = semantic_module._connect()
+    try:
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 3}
+    )
+    payload = json.loads(response[0].text)
+    assert payload["total_results"] == 3
+    assert payload["papers"][0]["id"] == "2403.00001"
+
+
+@pytest.mark.asyncio
+async def test_reindex_refreshes_index_meta(
+    semantic_test_env, monkeypatch, temp_storage_path
+):
+    """After a clear_existing rebuild, index_meta reflects the active backend/model."""
+    Path(temp_storage_path, "2404.00001.md").write_text("paper", encoding="utf-8")
+
+    def _mock_index(paper_id):
+        return semantic_module._upsert_index_record(
+            paper_id=paper_id,
+            title="Title",
+            abstract="transformer vision study",
+            authors=[],
+            categories=[],
+        )
+
+    monkeypatch.setattr(semantic_module, "index_paper_by_id", _mock_index)
+
+    await semantic_module.handle_reindex({"clear_existing": True})
+
+    meta = semantic_module._read_index_meta()
+    assert (
+        meta["embedding_model"]
+        == "sentence-transformers:sentence-transformers/all-MiniLM-L6-v2"
+    )
+    assert meta["embedding_dim"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_reindex_no_clear_refuses_dim_mismatch(semantic_test_env, monkeypatch):
+    """reindex(clear_existing=false) refuses to append vectors of a different
+    dimension onto the existing index (mixing dims would corrupt/crash ranking)."""
+    # Reset the module lock onto this test's loop (mirrors the cancel test): a
+    # sibling lock-contending test may have bound it to a now-closed loop.
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+    _index_three_papers()  # dim-3 rows
+
+    # Active model now produces dim-4 vectors -> appending would mix dimensions.
+    monkeypatch.setattr(
+        semantic_module, "_embed_text", lambda text: np.zeros(4, dtype=np.float32)
+    )
+
+    response = await semantic_module.handle_reindex({"clear_existing": False})
+    payload = json.loads(response[0].text)
+    assert payload["status"] == "error"
+    assert "clear_existing=true" in payload["message"]
+
+
+def test_upsert_refuses_dim_mismatch_leaves_index_unchanged(
+    semantic_test_env, monkeypatch
+):
+    """_upsert_index_record refuses a write whose dimension differs from the
+    existing index (B23): returns False and leaves both the rows and index_meta
+    untouched — it must NOT insert a mixed-dim row or overwrite meta to the new
+    model. This is the single authoritative write path, so this refusal is what
+    makes mixed-dim indexes structurally impossible."""
+    _index_three_papers()  # dim-3 rows + meta (ST, dim 3)
+    meta_before = semantic_module._read_index_meta()
+
+    # The active model now emits a different dimension than the stored index.
+    monkeypatch.setattr(
+        semantic_module, "_embed_text", lambda text: np.zeros(4, dtype=np.float32)
+    )
+
+    result = semantic_module._upsert_index_record(
+        paper_id="2405.00009",
+        title="Mismatch",
+        abstract="whatever",
+        authors=[],
+        categories=[],
+    )
+    assert result is False
+
+    conn = semantic_module._connect()
+    try:
+        rows = conn.execute(
+            "SELECT paper_id, embedding_dim FROM semantic_index"
+        ).fetchall()
+    finally:
+        conn.close()
+    # No new row, and no 4-dim row landed.
+    assert len(rows) == 3
+    assert all(int(r["embedding_dim"]) == 3 for r in rows)
+    assert "2405.00009" not in {r["paper_id"] for r in rows}
+    # Meta NOT overwritten to the current (mismatched) model.
+    assert semantic_module._read_index_meta() == meta_before
+
+
+@pytest.mark.asyncio
+async def test_paper_id_index_on_miss_refuses_dim_mismatch(
+    semantic_test_env, monkeypatch
+):
+    """paper_id-mode index-on-miss against a legacy (no-meta) index with a
+    switched backend: the upsert refuses the mismatched dimension, so the handler
+    returns 'Could not index source paper' — NOT a crash, and NOT a silent
+    meta-overwrite / mixed-dim row (B23)."""
+    # Reset the module lock onto this test's loop (a sibling lock-contending test
+    # may have bound it to a now-closed loop).
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+
+    _index_three_papers()  # dim-3 rows
+    # Legacy pre-B23 index: rows present, meta absent.
+    conn = semantic_module._connect()
+    try:
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # The active model now emits a different dimension than the stored index.
+    monkeypatch.setattr(
+        semantic_module, "_embed_text", lambda text: np.zeros(4, dtype=np.float32)
+    )
+
+    # index-on-miss routes through index_paper_by_id -> _upsert_index_record;
+    # bypass the network but keep the real upsert (its refusal is under test).
+    def _index(pid):
+        return semantic_module._upsert_index_record(
+            paper_id=pid,
+            title="New",
+            abstract="brand new paper",
+            authors=[],
+            categories=[],
+        )
+
+    monkeypatch.setattr(semantic_module, "index_paper_by_id", _index)
+
+    response = await semantic_module.handle_semantic_search({"paper_id": "9999.00001"})
+    assert "Could not index source paper" in response[0].text
+
+    # No 4-dim row landed; meta still absent; still exactly 3 dim-3 rows.
+    conn = semantic_module._connect()
+    try:
+        rows = conn.execute("SELECT embedding_dim FROM semantic_index").fetchall()
+        meta_count = conn.execute("SELECT COUNT(*) AS c FROM index_meta").fetchone()
+    finally:
+        conn.close()
+    assert len(rows) == 3
+    assert all(int(r["embedding_dim"]) == 3 for r in rows)
+    assert meta_count["c"] == 0
+
+
+def test_model2vec_empty_string_zero_vector_no_nan(monkeypatch):
+    """model2vec returns a zero vector for empty text; _embed_text leaves it as-is
+    (no divide-by-norm -> no NaN), and a zero query vector ranks with score 0."""
+
+    class _ZeroStatic:
+        def encode(self, text):
+            if not text:
+                return np.zeros(3, dtype=np.float32)
+            return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    class _Factory:
+        @staticmethod
+        def from_pretrained(name):
+            return _ZeroStatic()
+
+    monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
+    monkeypatch.setattr(semantic_module, "StaticModel", _Factory)
+    monkeypatch.setattr(semantic_module.settings, "EMBEDDING_MODEL", None)
+    _reset_model_globals(monkeypatch)
+
+    zero = semantic_module._embed_text("")
+    assert np.all(zero == 0.0)
+    assert not np.any(np.isnan(zero))
+
+    candidates = [
+        {
+            "paper_id": "p1",
+            "title": "t",
+            "abstract": "a",
+            "authors": [],
+            "categories": [],
+            "published": "",
+            "vector": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        }
+    ]
+    ranked = semantic_module._rank_by_similarity(zero, candidates, max_results=3)
+    assert len(ranked) == 1
+    assert ranked[0].score == 0.0
+    assert not np.isnan(ranked[0].score)
