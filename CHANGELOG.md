@@ -10,8 +10,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-17
+
 Repo polish after the v0.7.0 PyPI release, plus reliability/ergonomics fixes
-driven by multi-agent field use.
+driven by multi-agent field use. Headlines: `search_papers`' category filter is
+now a strict `AND` (it was silently advisory), query text is properly
+percent-encoded, `total_results` is the real corpus-wide count, and every
+arXiv call path paces through a cross-process rate limiter so parallel agent
+fleets sharing one machine stay under arXiv's per-IP limit.
 
 ### Added
 - Contributor scaffolding: `CONTRIBUTING.md`, GitHub issue templates (bug / feature),
@@ -246,7 +252,8 @@ _Published as `arxiv-mcp-server`._
 Published as `arxiv-mcp-server` by Joseph Blazick. See the
 [commit history](https://github.com/loganrooks/arxiv-mcp-pro/commits/main) for details.
 
-[Unreleased]: https://github.com/loganrooks/arxiv-mcp-pro/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/loganrooks/arxiv-mcp-pro/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/loganrooks/arxiv-mcp-pro/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.7.0
 [0.6.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.6.0
 [0.5.0]: https://github.com/loganrooks/arxiv-mcp-pro/releases/tag/v0.5.0
