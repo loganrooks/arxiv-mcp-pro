@@ -583,10 +583,11 @@ def test_index_paper_by_id_records_even_when_fetch_raises(monkeypatch):
 class DummyStaticModel:
     """model2vec-style static model: `.encode(text)` returns a fixed vector.
 
-    The vector is deliberately NON-unit so a test can prove `_embed_text` does
-    not re-normalize it on the model2vec path (model2vec normalizes at encode
-    time; re-normalizing would change these values and inject NaN for a zero
-    vector).
+    The vector is deliberately NON-unit so a test can prove `_embed_text` adds NO
+    normalization layer of its own on the model2vec path (F5: normalization is
+    enforced at LOAD time via `from_pretrained(..., normalize=True)`, not by
+    `_embed_text`; if `_embed_text` re-normalized, these values would collapse to
+    a unit vector and a zero vector would become NaN).
     """
 
     def __init__(self, vector):
@@ -631,14 +632,16 @@ def test_active_backend_none_gives_two_extra_dependency_error(monkeypatch):
 
 
 def test_model2vec_embed_path_does_not_renormalize(monkeypatch):
-    """model2vec backend: _get_model loads via from_pretrained; _embed_text returns
-    the model's vector untouched (no re-normalization)."""
+    """model2vec backend: _get_model loads via from_pretrained with normalize=True
+    (F5); _embed_text returns the model's vector untouched (adds no normalization
+    layer of its own)."""
     captured = {}
 
     class _StaticModelFactory:
         @staticmethod
-        def from_pretrained(name):
+        def from_pretrained(name, normalize=False):
             captured["name"] = name
+            captured["normalize"] = normalize
             return DummyStaticModel([3.0, 4.0])  # norm 5 -> unit iff re-normalized
 
     monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
@@ -648,10 +651,12 @@ def test_model2vec_embed_path_does_not_renormalize(monkeypatch):
 
     vector = semantic_module._embed_text("hello")
 
-    # Loaded through the model2vec path with the default model name.
+    # Loaded through the model2vec path with the default model name AND the
+    # cosine-safety kwarg (F5).
     assert captured["name"] == "minishlab/potion-retrieval-32M"
+    assert captured["normalize"] is True
     assert isinstance(semantic_module._get_model(), DummyStaticModel)
-    # Returned untouched — NOT collapsed to a unit vector.
+    # Returned untouched — NOT collapsed to a unit vector by _embed_text.
     assert np.allclose(vector, np.array([3.0, 4.0], dtype=np.float32))
     assert vector.dtype == np.float32
 
@@ -662,8 +667,9 @@ def test_embedding_model_override_model2vec(monkeypatch):
 
     class _StaticModelFactory:
         @staticmethod
-        def from_pretrained(name):
+        def from_pretrained(name, normalize=False):
             captured["name"] = name
+            captured["normalize"] = normalize
             return DummyStaticModel([1.0, 0.0])
 
     monkeypatch.setattr(semantic_module, "SentenceTransformer", None)
@@ -675,6 +681,7 @@ def test_embedding_model_override_model2vec(monkeypatch):
 
     semantic_module._get_model()
     assert captured["name"] == "myorg/custom-static"
+    assert captured["normalize"] is True
 
 
 def test_embedding_model_override_sentence_transformers(monkeypatch):
@@ -850,19 +857,20 @@ def test_upsert_refuses_dim_mismatch_leaves_index_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_paper_id_index_on_miss_refuses_dim_mismatch(
+async def test_paper_id_incompatible_index_returns_reindex_guidance(
     semantic_test_env, monkeypatch
 ):
-    """paper_id-mode index-on-miss against a legacy (no-meta) index with a
-    switched backend: the upsert refuses the mismatched dimension, so the handler
-    returns 'Could not index source paper' — NOT a crash, and NOT a silent
-    meta-overwrite / mixed-dim row (B23)."""
+    """F6 + F3: paper_id mode on a legacy (meta-free) index after a model switch
+    returns the actionable reindex guidance via the UP-FRONT identity check —
+    NOT the generic 'Could not index source paper' — and performs NO write. The
+    identity is inferred as the legacy MiniLM model (F3), and the check fires
+    before any index-on-miss attempt (F6)."""
     # Reset the module lock onto this test's loop (a sibling lock-contending test
     # may have bound it to a now-closed loop).
     monkeypatch.setattr(semantic_module, "_reindex_lock", None)
 
-    _index_three_papers()  # dim-3 rows
-    # Legacy pre-B23 index: rows present, meta absent.
+    _index_three_papers()  # dim-3 rows, meta stamped ST/MiniLM
+    # Legacy pre-B23 index: strip meta so the identity must be INFERRED (F3).
     conn = semantic_module._connect()
     try:
         conn.execute("DELETE FROM index_meta")
@@ -870,28 +878,21 @@ async def test_paper_id_index_on_miss_refuses_dim_mismatch(
     finally:
         conn.close()
 
-    # The active model now emits a different dimension than the stored index.
+    # Simulate a model switch: the active model differs from the legacy identity.
     monkeypatch.setattr(
-        semantic_module, "_embed_text", lambda text: np.zeros(4, dtype=np.float32)
+        semantic_module.settings, "EMBEDDING_MODEL", "minishlab/potion-retrieval-32M"
     )
 
-    # index-on-miss routes through index_paper_by_id -> _upsert_index_record;
-    # bypass the network but keep the real upsert (its refusal is under test).
-    def _index(pid):
-        return semantic_module._upsert_index_record(
-            paper_id=pid,
-            title="New",
-            abstract="brand new paper",
-            authors=[],
-            categories=[],
-        )
+    # The up-front guard (F6) must fire BEFORE any index-on-miss attempt.
+    def _boom(pid):
+        raise AssertionError("index-on-miss must not run on an incompatible index")
 
-    monkeypatch.setattr(semantic_module, "index_paper_by_id", _index)
+    monkeypatch.setattr(semantic_module, "index_paper_by_id", _boom)
 
     response = await semantic_module.handle_semantic_search({"paper_id": "9999.00001"})
-    assert "Could not index source paper" in response[0].text
+    assert "reindex" in response[0].text.lower()
 
-    # No 4-dim row landed; meta still absent; still exactly 3 dim-3 rows.
+    # No write happened; meta still absent; still exactly 3 dim-3 rows.
     conn = semantic_module._connect()
     try:
         rows = conn.execute("SELECT embedding_dim FROM semantic_index").fetchall()
@@ -901,6 +902,202 @@ async def test_paper_id_index_on_miss_refuses_dim_mismatch(
     assert len(rows) == 3
     assert all(int(r["embedding_dim"]) == 3 for r in rows)
     assert meta_count["c"] == 0
+
+
+def test_upsert_uses_begin_immediate_transaction(semantic_test_env, monkeypatch):
+    """F1: the compatibility read and the write live in ONE explicit write
+    transaction opened with BEGIN IMMEDIATE (spanning the SELECT so a second
+    process cannot slip a conflicting write in between — TOCTOU)."""
+    statements = []
+    real_connect = semantic_module._connect
+
+    def _traced_connect():
+        conn = real_connect()
+        conn.set_trace_callback(lambda s: statements.append(s))
+        return conn
+
+    monkeypatch.setattr(semantic_module, "_connect", _traced_connect)
+
+    assert (
+        semantic_module._upsert_index_record(
+            paper_id="2406.00001",
+            title="T",
+            abstract="transformer vision",
+            authors=[],
+            categories=[],
+        )
+        is True
+    )
+
+    upper = [s.strip().upper() for s in statements]
+    assert any(s.startswith("BEGIN IMMEDIATE") for s in upper)
+    # The write happens INSIDE that transaction: INSERT after BEGIN, then COMMIT.
+    begin_idx = next(i for i, s in enumerate(upper) if s.startswith("BEGIN IMMEDIATE"))
+    insert_idx = next(
+        i for i, s in enumerate(upper) if s.startswith("INSERT INTO SEMANTIC_INDEX")
+    )
+    assert begin_idx < insert_idx
+    assert any(s.startswith("COMMIT") for s in upper)
+
+
+def test_upsert_refuses_same_dim_model_switch(semantic_test_env, monkeypatch):
+    """F2: a model switch at the SAME dimension is refused by the identity check
+    (a dimension-only check would not catch it) — no write, meta untouched."""
+    _index_three_papers()  # dim-3, meta = ST/MiniLM
+    meta_before = semantic_module._read_index_meta()
+
+    # Same backend + dimension (DummyModel stays dim-3), different model name.
+    monkeypatch.setattr(
+        semantic_module.settings, "EMBEDDING_MODEL", "different/same-dim-model"
+    )
+
+    result = semantic_module._upsert_index_record(
+        paper_id="2407.00001",
+        title="T",
+        abstract="transformer vision study",
+        authors=[],
+        categories=[],
+    )
+    assert result is False
+
+    conn = semantic_module._connect()
+    try:
+        rows = conn.execute(
+            "SELECT paper_id, embedding_dim FROM semantic_index"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 3
+    assert "2407.00001" not in {r["paper_id"] for r in rows}
+    assert all(int(r["embedding_dim"]) == 3 for r in rows)
+    assert semantic_module._read_index_meta() == meta_before
+
+
+@pytest.mark.asyncio
+async def test_legacy_index_pro_st_matches_and_first_upsert_stamps_meta(
+    semantic_test_env, monkeypatch
+):
+    """F3 (matching direction): a legacy (meta-free) index under the [pro-st]
+    defaults (ST/MiniLM == the inferred legacy identity) is compatible — searches
+    work unchanged, and the first upsert re-stamps index_meta."""
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+    _index_three_papers()
+    # Strip meta -> legacy pre-B23 index. Active backend is ST/MiniLM (fixture, no
+    # EMBEDDING_MODEL override) == the inferred legacy identity.
+    conn = semantic_module._connect()
+    try:
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Search works (no reindex error) because identities match.
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer", "max_results": 3}
+    )
+    payload = json.loads(response[0].text)
+    assert payload["total_results"] == 3
+    assert payload["papers"][0]["id"] == "2403.00001"
+
+    # Meta stays absent until a write happens...
+    assert semantic_module._read_index_meta() == {}
+    # ...and the next (same-identity, allowed) upsert stamps it.
+    assert (
+        semantic_module._upsert_index_record(
+            paper_id="2403.00004",
+            title="More",
+            abstract="transformer vision extra",
+            authors=[],
+            categories=[],
+        )
+        is True
+    )
+    meta = semantic_module._read_index_meta()
+    assert (
+        meta["embedding_model"]
+        == "sentence-transformers:sentence-transformers/all-MiniLM-L6-v2"
+    )
+    assert meta["embedding_dim"] == "3"
+
+
+def test_legacy_meta_free_model_switch_refuses_write(semantic_test_env, monkeypatch):
+    """F3 (mismatching direction): a legacy (meta-free) index whose INFERRED
+    identity (MiniLM) differs from the active model is refused at the write path,
+    even at the same dimension. Mutation target for the legacy-identity inference."""
+    _index_three_papers()
+    conn = semantic_module._connect()
+    try:
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Same dimension (DummyModel dim-3), different model -> identity mismatch vs
+    # the inferred legacy identity.
+    monkeypatch.setattr(
+        semantic_module.settings, "EMBEDDING_MODEL", "different/same-dim-model"
+    )
+
+    result = semantic_module._upsert_index_record(
+        paper_id="2408.00001",
+        title="T",
+        abstract="transformer vision",
+        authors=[],
+        categories=[],
+    )
+    assert result is False
+
+    conn = semantic_module._connect()
+    try:
+        rows = conn.execute("SELECT paper_id FROM semantic_index").fetchall()
+        meta_count = conn.execute("SELECT COUNT(*) AS c FROM index_meta").fetchone()
+    finally:
+        conn.close()
+    assert len(rows) == 3
+    assert "2408.00001" not in {r["paper_id"] for r in rows}
+    assert meta_count["c"] == 0  # a refused write never stamps meta
+
+
+@pytest.mark.asyncio
+async def test_legacy_meta_free_model_switch_query_mode_reindex_error(
+    semantic_test_env, monkeypatch
+):
+    """F3: a legacy (meta-free) index + a same-dim model switch trips the reindex
+    guard in QUERY mode too (identity inferred as the legacy MiniLM model)."""
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+    _index_three_papers()
+    conn = semantic_module._connect()
+    try:
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(
+        semantic_module.settings, "EMBEDDING_MODEL", "different/same-dim-model"
+    )
+
+    response = await semantic_module.handle_semantic_search(
+        {"query": "vision transformer"}
+    )
+    assert "reindex" in response[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_reindex_no_clear_refuses_model_switch(semantic_test_env, monkeypatch):
+    """F2 on the rebuild path: reindex(clear_existing=false) refuses when the
+    active model IDENTITY differs from the index's, even at the same dimension."""
+    monkeypatch.setattr(semantic_module, "_reindex_lock", None)
+    _index_three_papers()  # meta = ST/MiniLM, dim-3
+
+    # Same dimension (DummyModel probe -> dim-3), different model identity.
+    monkeypatch.setattr(
+        semantic_module.settings, "EMBEDDING_MODEL", "different/same-dim-model"
+    )
+
+    response = await semantic_module.handle_reindex({"clear_existing": False})
+    payload = json.loads(response[0].text)
+    assert payload["status"] == "error"
+    assert "clear_existing=true" in payload["message"]
 
 
 def test_model2vec_empty_string_zero_vector_no_nan(monkeypatch):
@@ -915,7 +1112,7 @@ def test_model2vec_empty_string_zero_vector_no_nan(monkeypatch):
 
     class _Factory:
         @staticmethod
-        def from_pretrained(name):
+        def from_pretrained(name, normalize=False):
             return _ZeroStatic()
 
     monkeypatch.setattr(semantic_module, "SentenceTransformer", None)

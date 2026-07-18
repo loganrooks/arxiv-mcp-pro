@@ -15,6 +15,29 @@ from arxiv_mcp_server.tools.download import (
     PaperNotFoundError,
 )
 
+
+@pytest.fixture(autouse=True)
+def _stub_background_indexing(monkeypatch):
+    """Neutralize download.py's fire-and-forget semantic indexing in these tests.
+
+    handle_download schedules `asyncio.create_task(_run_index_by_id(...))` on a
+    cache hit / successful fetch. With the real (unmocked) indexer those tasks
+    perform a LIVE arXiv fetch and write the shared semantic index — real network
+    + real home-dir DB leaking out of otherwise-hermetic unit tests that mock
+    every foreground fetch. Left live, concurrent background writers also contend
+    on the index write lock (B23's BEGIN IMMEDIATE) and can deadlock at
+    event-loop teardown. Replace both indexing coroutines with async no-ops so
+    each test exercises only the download path it intends to.
+    """
+    import arxiv_mcp_server.tools.download as dl
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(dl, "_run_index_by_id", _noop)
+    monkeypatch.setattr(dl, "_run_index_from_result", _noop)
+
+
 # ---------------------------------------------------------------------------
 # PDF download helper (httpx streaming)
 # ---------------------------------------------------------------------------
