@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "arxiv-mcp-pro",
   "display_name": "ArXiv MCP Pro",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Search, download, and analyze arXiv papers via MCP.",
   "author": {
     "name": "Logan Rooks",
